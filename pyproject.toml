@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "BSD-3-Clause"}
 requires-python = ">=3.8"
 authors = [
-    {name = "[YOUR NAME HERE]", email = "[YOUR EMAIL HERE]"},
+    {name = "Dr. Corentin J. Lapeyre", email = "corentin.lapeyre@gmail.com"},
 ]
 keywords = ["acoustics", "underwater", "parabolic-equation", "gpu", "cuda", "ram"]
 classifiers = [
@@ -42,9 +42,9 @@ test = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/[YOUR-USERNAME]/cupyram"
-Repository = "https://github.com/[YOUR-USERNAME]/cupyram"
-Issues = "https://github.com/[YOUR-USERNAME]/cupyram/issues"
+Homepage = "https://github.com/clapeyre/cupyram"
+Repository = "https://github.com/clapeyre/cupyram"
+Issues = "https://github.com/clapeyre/cupyram/issues"
 
 [tool.hatch.build.targets.sdist]
 include = [
