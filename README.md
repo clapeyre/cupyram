@@ -22,17 +22,29 @@ Library](https://oalib-acoustics.org/models-and-software/parabolic-equation).
 
 - Python >= 3.8
 - NVIDIA GPU with CUDA support
-- CUDA Toolkit 12.x or compatible
+- CUDA Toolkit 11.x, 12.x, or 13.x
+- CuPy (matching your CUDA version)
 
 ## Installation
 
+CuPyRAM requires CuPy, which must match your CUDA version. Install based on your CUDA toolkit version:
+
 ```bash
+# For CUDA 11.x
+pip install cupyram[cuda11]
+
+# For CUDA 12.x
+pip install cupyram[cuda12]
+
+# For CUDA 13.x
+pip install cupyram[cuda13]
+
+# Or install CuPy separately first, then cupyram
+pip install cupy-cuda12x  # or cupy-cuda11x, cupy-cuda13x
 pip install cupyram
 ```
 
-**Note**: This package requires a CUDA-capable GPU and the appropriate CUDA
-drivers. CuPy will be installed as a dependency, which provides the GPU
-acceleration.
+**Check your CUDA version**: Run `nvcc --version` or `nvidia-smi` to determine your CUDA version.
 
 ### Optional Dependencies
 
