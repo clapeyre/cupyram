@@ -397,16 +397,21 @@ class CuPyRAM:
         self.rd_sb = rp_sb_0.size > 1
         self.rd_bt = rbzb_0.shape[0] > 1
         
-        # Transfer environment arrays to GPU (after validation)
+        # MEMORY OPTIMIZATION: Transfer only light arrays to GPU
+        # Heavy arrays (_cw, _cb, _rhob, _attn) are streamed on-demand in profl()
+        # This saves massive VRAM for large batch sizes with varying-length profiles
+        
+        # Light arrays: indices and bathymetry (always needed on GPU)
         self._z_ss = cupy.asarray(self._z_ss)
         self._rp_ss = cupy.asarray(self._rp_ss)
-        self._cw = cupy.asarray(self._cw)
         self._z_sb = cupy.asarray(self._z_sb)
         self._rp_sb = cupy.asarray(self._rp_sb)
-        self._cb = cupy.asarray(self._cb)
-        self._rhob = cupy.asarray(self._rhob)
-        self._attn = cupy.asarray(self._attn)
         self._rbzb = cupy.asarray(self._rbzb)
+        
+        # Heavy arrays: environment profiles (keep on CPU, stream to GPU in profl())
+        # These remain NumPy arrays: [Batch, Nz_in, Nr]
+        # self._cw, self._cb, self._rhob, self._attn stay as NumPy
+        # Benefit: Saves GBs of VRAM for large batches with NaN-padded profiles
 
     def get_params(self, **kwargs):
         """
@@ -423,10 +428,9 @@ class CuPyRAM:
         else:
             # Compute per-ray c0 from each ray's profile (filter NaN padding)
             # Ensures perfect numerical agreement with CPU
-            # After check_inputs(), self._cw is always a CuPy array
-            cw_cpu = cupy.asnumpy(self._cw)
+            # Note: self._cw is now kept on CPU (NumPy) for memory optimization
             self._c0_array = numpy.array([
-                (numpy.nanmean(cw_cpu[b, :, 0]) if len(cw_cpu[b].shape) > 1 else numpy.nanmean(cw_cpu[b]))
+                (numpy.nanmean(self._cw[b, :, 0]) if len(self._cw[b].shape) > 1 else numpy.nanmean(self._cw[b]))
                 for b in range(self._batch_size)
             ])
             # Use mean c0 for shared parameters (dr, dz, lambda)
@@ -644,30 +648,40 @@ class CuPyRAM:
     def profl(self):
         """
         Set up profiles. Interpolate per-ray environments on GPU.
-        Uses batched CUDA kernel for parallel interpolation.
+        Uses batched CUDA kernel with CPU-GPU streaming for environment data.
+        
+        MEMORY OPTIMIZATION: Heavy environment arrays (_cw, _cb, _rhob, _attn)
+        are stored on CPU and only active profiles are streamed to GPU.
+        This saves GBs of VRAM for large batches with varying-length profiles.
         """
         z = cupy.linspace(0, self._zmax, self.nz + 2)
         
-        # Select Active Profiles (Batched Fancy Indexing)
-        # Convert GPU indices to CPU for indexing (environment arrays already on GPU)
-        ss_ind_cpu = cupy.asnumpy(self.ss_ind)
-        sb_ind_cpu = cupy.asnumpy(self.sb_ind)
-        batch_indices_cpu = numpy.arange(self._batch_size)
+        # CPU-GPU STREAMING: Slice active profiles on CPU, transfer small slice to GPU
+        # Get active indices from GPU to CPU
+        with nvtx.annotate("get_active_indices", color="yellow"):
+            ss_ind_cpu = cupy.asnumpy(self.ss_ind)
+            sb_ind_cpu = cupy.asnumpy(self.sb_ind)
+            batch_indices_cpu = numpy.arange(self._batch_size)
         
-        # Index GPU arrays by transferring indices to CPU, indexing, then back to GPU
-        # This is necessary because CuPy doesn't support advanced indexing with per-element indices
-        current_cw_prof = self._cw[batch_indices_cpu, :, ss_ind_cpu]
-        current_cb_prof = self._cb[batch_indices_cpu, :, sb_ind_cpu]
-        current_rhob_prof = self._rhob[batch_indices_cpu, :, sb_ind_cpu]
-        current_attn_prof = self._attn[batch_indices_cpu, :, sb_ind_cpu]
+        # SLICE ON CPU (Host RAM) - environment arrays are still NumPy
+        # Extract only the current active profile for each ray: [Batch, Nz_in]
+        with nvtx.annotate("slice_profiles_cpu", color="orange"):
+            current_cw_prof_cpu = self._cw[batch_indices_cpu, :, ss_ind_cpu]
+            current_cb_prof_cpu = self._cb[batch_indices_cpu, :, sb_ind_cpu]
+            current_rhob_prof_cpu = self._rhob[batch_indices_cpu, :, sb_ind_cpu]
+            current_attn_prof_cpu = self._attn[batch_indices_cpu, :, sb_ind_cpu]
         
-        # Ensure everything is on GPU
-        z_ss_gpu = cupy.asarray(self._z_ss)
-        z_sb_gpu = cupy.asarray(self._z_sb)
-        current_cw_prof_gpu = cupy.asarray(current_cw_prof)
-        current_cb_prof_gpu = cupy.asarray(current_cb_prof)
-        current_rhob_prof_gpu = cupy.asarray(current_rhob_prof)
-        current_attn_prof_gpu = cupy.asarray(current_attn_prof)
+        # TRANSFER TO GPU (PCIe) - only the active slice (~80 MB vs GBs)
+        # Transfer time: ~2-3 ms on PCIe Gen4, negligible compared to computation
+        with nvtx.annotate("transfer_profiles_to_gpu", color="green"):
+            current_cw_prof_gpu = cupy.asarray(current_cw_prof_cpu)
+            current_cb_prof_gpu = cupy.asarray(current_cb_prof_cpu)
+            current_rhob_prof_gpu = cupy.asarray(current_rhob_prof_cpu)
+            current_attn_prof_gpu = cupy.asarray(current_attn_prof_cpu)
+        
+        # Light arrays already on GPU
+        z_ss_gpu = self._z_ss
+        z_sb_gpu = self._z_sb
         
         # Pre-calculate absorbing layer width per ray
         # self._lyrw and self._lambda are scalars, so this is always a float
