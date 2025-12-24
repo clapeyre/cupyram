@@ -36,6 +36,11 @@ from cupyram.profl import profl_cuda_launcher
 from cupyram.updat import updat_indices_cuda
 from cupyram.matrc import matrc_cuda_init_profiles, matrc_cuda_single_pade
 
+# Global flag for fused kernel optimization
+# Set to True to use Sum formulation with on-the-fly matrix generation (67% memory savings)
+# Set to False to use legacy Product formulation (for validation/comparison)
+FUSED_KERNEL = True
+
 
 class CuPyRAM:
 
@@ -557,13 +562,20 @@ class CuPyRAM:
         # Memory savings: ~50% reduction in VRAM for these arrays
         self.ksq = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # GPU (single precision)
         
-        # Matrix coefficients [Nz+2, Batch] - no Np dimension (computed one Padé step at a time)
-        self.r1 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-        self.r2 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-        self.r3 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-        self.s1 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-        self.s2 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-        self.s3 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
+        # Matrix coefficients [Nz+2, Batch] - conditional allocation based on kernel type
+        if FUSED_KERNEL:
+            # Optimized fused kernel: Only 2 workspace arrays (67% memory reduction)
+            self.tdma_upper = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
+            self.tdma_rhs = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
+            # No r1-r3, s1-s3 allocation (computed on-the-fly in kernel)
+        else:
+            # Legacy product formulation: 6 arrays
+            self.r1 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
+            self.r2 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
+            self.r3 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
+            self.s1 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
+            self.s2 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
+            self.s3 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
         
         # Per-ray Padé coefficients [np, batch_size] on GPU (transposed for coalesced access)
         # Keep double precision for accuracy (mathematical constants)
@@ -687,39 +699,65 @@ class CuPyRAM:
     @nvtx.annotate("CuPyRAM._propagate_step", color="red")
     def _propagate_step(self):
         """
-        Fused matrc-solve propagation step.
-        Interleaves matrc computation and solve for each Padé coefficient.
-        Memory-efficient: computes r1...s3 one Padé term at a time.
-        Arrays: [Nz+2, Batch] for coalesced memory access.
+        Propagation step: advance solution one range step.
+        
+        Two implementations:
+        - FUSED_KERNEL=True: Sum formulation with on-the-fly matrix generation
+          (67% memory savings, 8x arithmetic intensity increase)
+        - FUSED_KERNEL=False: Legacy product formulation
+          (for validation and comparison)
         """
         
-        # Step 1: Init profiles (once per range step, outside Padé loop)
-        with nvtx.annotate("init_profiles", color="purple"):
-            matrc_cuda_init_profiles(
-                self.iz, self.iz, self.nz, self.f1, self.f2, self.f3, self.ksq,
-                self.alpw, self.alpb, self.ksqw, self.ksqb, self.rhob,
-                batch_size=self._batch_size
-            )
-        
-        # Step 2: Loop over Padé coefficients
-        for j in range(self._np):
-            # Extract Padé coefficients for this j: [Batch] slice (COALESCED!)
-            pd1_vals = self.pd1[j, :]  # Row access on [np, batch] → coalesced
-            pd2_vals = self.pd2[j, :]
-            
-            # Discretize and decompose for this Padé term
-            with nvtx.annotate(f"matrc_j{j}", color="orange"):
-                matrc_cuda_single_pade(
-                    self.k0, self._dz, self.iz, self.iz, self.nz,
-                    self.f1, self.f2, self.f3, self.ksq,
-                    self.r1, self.r2, self.r3, self.s1, self.s2, self.s3,
-                    pd1_vals, pd2_vals, batch_size=self._batch_size
+        if FUSED_KERNEL:
+            # === OPTIMIZED: Fused Sum-Padé Kernel ===
+            # Initialize environment (once per range step)
+            with nvtx.annotate("init_profiles", color="purple"):
+                matrc_cuda_init_profiles(
+                    self.iz, self.iz, self.nz, self.f1, self.f2, self.f3, self.ksq,
+                    self.alpw, self.alpb, self.ksqw, self.ksqb, self.rhob,
+                    batch_size=self._batch_size
                 )
             
-            # Solve for this Padé term
-            with nvtx.annotate(f"solve_j{j}", color="green"):
-                solve(self.u, self.v, self.s1, self.s2, self.s3,
-                      self.r1, self.r2, self.r3, self.iz, self.nz)
+            # Fused kernel: all Padé terms with on-the-fly matrix generation
+            with nvtx.annotate("fused_pade_solve", color="red"):
+                from cupyram.fused_kernel import fused_sum_pade_solve
+                fused_sum_pade_solve(
+                    self.u, self.u,  # In-place operation (u_in = u_out)
+                    self.f1, self.f2, self.f3, self.ksq,
+                    self.k0, self._dz, self.iz, self.nz,
+                    self.pd1, self.pd2,
+                    self.tdma_upper, self.tdma_rhs,
+                    self._batch_size
+                )
+        else:
+            # === LEGACY: Product Formulation ===
+            # Step 1: Init profiles (once per range step, outside Padé loop)
+            with nvtx.annotate("init_profiles", color="purple"):
+                matrc_cuda_init_profiles(
+                    self.iz, self.iz, self.nz, self.f1, self.f2, self.f3, self.ksq,
+                    self.alpw, self.alpb, self.ksqw, self.ksqb, self.rhob,
+                    batch_size=self._batch_size
+                )
+            
+            # Step 2: Loop over Padé coefficients
+            for j in range(self._np):
+                # Extract Padé coefficients for this j: [Batch] slice (COALESCED!)
+                pd1_vals = self.pd1[j, :]  # Row access on [np, batch] → coalesced
+                pd2_vals = self.pd2[j, :]
+                
+                # Discretize and decompose for this Padé term
+                with nvtx.annotate(f"matrc_j{j}", color="orange"):
+                    matrc_cuda_single_pade(
+                        self.k0, self._dz, self.iz, self.iz, self.nz,
+                        self.f1, self.f2, self.f3, self.ksq,
+                        self.r1, self.r2, self.r3, self.s1, self.s2, self.s3,
+                        pd1_vals, pd2_vals, batch_size=self._batch_size
+                    )
+                
+                # Solve for this Padé term
+                with nvtx.annotate(f"solve_j{j}", color="green"):
+                    solve(self.u, self.v, self.s1, self.s2, self.s3,
+                          self.r1, self.r2, self.r3, self.iz, self.nz)
     
     def _outpt(self):
         """Compute transmission loss outputs on GPU using CUDA kernel."""

@@ -316,3 +316,58 @@ def compute_pade_coefficients_batch(freq, c0_array, np_pade, ns, dr, ip, max_wor
     
     return pd1_batch, pd2_batch
 
+
+def compute_partial_fractions(pd1, pd2):
+    """
+    Convert Padé poles to partial fraction form for sum formulation.
+    
+    The current Padé approximation is in product form:
+        exp(i*k0*dr*sqrt(1+X)) ≈ ∏[1 + pd2[j]/(X - pd1[j])]
+    
+    For the sum formulation (RAM 1.0p), we need:
+        exp(i*k0*dr*sqrt(1+X)) ≈ 1 + Σ[gamma[j]/(X - beta[j])]
+    
+    This function converts from product to sum form using partial fraction
+    decomposition and residue calculation.
+    
+    Args:
+        pd1: [np_pade, batch_size] - Padé poles (NumPy array)
+        pd2: [np_pade, batch_size] - Padé residues (NumPy array)
+    
+    Returns:
+        gamma: [np_pade, batch_size] - Partial fraction residues
+        beta: [np_pade, batch_size] - Partial fraction poles
+    
+    Mathematical approach:
+        - beta[j] = pd1[j] (poles remain the same)
+        - gamma[j] computed via residue calculation at each pole
+        - For product ∏(1 + a_j/(x-p_j)), the sum form residue at pole p_k is:
+          gamma[k] = a_k * ∏_{j≠k}(1 + a_j/(p_k - p_j))
+    """
+    np_pade, batch_size = pd1.shape
+    
+    # Allocate output arrays
+    gamma = np.zeros((np_pade, batch_size), dtype=np.complex128)
+    beta = np.zeros((np_pade, batch_size), dtype=np.complex128)
+    
+    # Beta (poles) are the same as pd1
+    beta[:, :] = pd1[:, :]
+    
+    # Compute gamma (residues) via residue calculation
+    # For each Padé term k, compute the residue at pole pd1[k]
+    for b in range(batch_size):
+        for k in range(np_pade):
+            # Start with pd2[k] (the coefficient in the product form)
+            residue = pd2[k, b]
+            
+            # Multiply by the product of all other terms evaluated at this pole
+            for j in range(np_pade):
+                if j != k:
+                    # Evaluate term j at pole k: 1 + pd2[j]/(pd1[k] - pd1[j])
+                    term = 1.0 + pd2[j, b] / (pd1[k, b] - pd1[j, b])
+                    residue *= term
+            
+            gamma[k, b] = residue
+    
+    return gamma, beta
+
