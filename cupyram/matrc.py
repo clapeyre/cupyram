@@ -15,62 +15,95 @@ import nvtx
 
 @cuda.jit
 def init_profiles_kernel(iz_arr, jz_arr, nz, f1, f2, f3, ksq, 
-                         alpw, alpb, ksqw, ksqb, rhob, batch_size):
+                         alpw, alpb, ksqw, ksqb, rhob, 
+                         env_batch_size, calc_batch_size, n_freqs):
     """
-    KERNEL 1: Environment Setup
-    Parallelism: Batch x Depth
-    Arrays: [Nz+2, Batch] for coalesced access
+    KERNEL 1: Environment Setup with Broadcast Indexing
+    Parallelism: N_calc x Depth
+    
+    CRITICAL: Race condition guard - only first frequency per environment writes to f1/f2/f3
+    
+    Args:
+        f1, f2, f3: [Nz+2, N_env] - shared geometry (write once per env)
+        ksq: [Nz+2, N_calc] - per-calculation field
+        alpw, alpb: [Nz+2, N_env] - shared properties
+        ksqw, ksqb: [Nz+2, N_calc] - frequency-dependent
+        rhob: [Nz+2, N_env] - shared property
+        iz_arr, jz_arr: [N_env] - per-environment bathymetry
+        env_batch_size: N_env
+        calc_batch_size: N_calc
+        n_freqs: N_freq
     """
     tid = cuda.grid(1)
     stride = cuda.gridsize(1)
     
-    total_points = (nz + 2) * batch_size
+    total_points = calc_batch_size * (nz + 2)
     
     for idx in range(tid, total_points, stride):
-        # Decode index: arrays are [Nz+2, Batch] -> Fastest dim is Batch
-        # Adjacent threads (varying b) access adjacent memory
-        b = idx % batch_size
-        i = idx // batch_size
+        # Decode index: parallelize over N_calc × (Nz+2)
+        b = idx % calc_batch_size  # Calculation index [0..N_calc-1]
+        i = idx // calc_batch_size  # Depth index [0..Nz+1]
         
-        # Per-ray parameters
-        iz = iz_arr[b]
-        jz = jz_arr[b]
+        # Compute environment index from calculation index
+        env_idx = b // n_freqs  # Maps multiple calc indices to same env
         
-        # Logic matches original, but parallel per point
-        val_f1 = 0.0
-        val_f2 = 0.0
-        val_f3 = 0.0
+        # Per-environment parameters
+        iz = iz_arr[env_idx]
+        jz = jz_arr[env_idx]
+        
+        # === CRITICAL FIX: Race Condition Guard ===
+        # Only the FIRST frequency per environment writes to shared arrays
+        # This prevents multiple threads from writing to f1[i, env_idx] simultaneously
+        if b % n_freqs == 0:
+            # Compute and write shared geometry (f1, f2, f3)
+            val_f1 = 0.0
+            val_f2 = 0.0
+            val_f3 = 0.0
+            
+            if iz == jz:
+                if i <= iz:
+                    val_f1 = 1.0 / alpw[i, env_idx]
+                    val_f2 = 1.0
+                    val_f3 = alpw[i, env_idx]
+                else:
+                    val_f1 = rhob[i, env_idx] / alpb[i, env_idx]
+                    val_f2 = 1.0 / rhob[i, env_idx]
+                    val_f3 = alpb[i, env_idx]
+            elif iz > jz:
+                if i > jz and i <= iz:
+                    val_f1 = 1.0 / alpw[i, env_idx]
+                    val_f2 = 1.0
+                    val_f3 = alpw[i, env_idx]
+            else:  # iz < jz
+                if i > iz and i <= jz:
+                    val_f1 = rhob[i, env_idx] / alpb[i, env_idx]
+                    val_f2 = 1.0 / rhob[i, env_idx]
+                    val_f3 = alpb[i, env_idx]
+            
+            # Write to shared environment arrays (coalesced access)
+            f1[i, env_idx] = val_f1
+            f2[i, env_idx] = val_f2
+            f3[i, env_idx] = val_f3
+        
+        # Synchronize to ensure f1/f2/f3 are written before ksq computation
+        cuda.syncthreads()
+        
+        # === ALL threads compute their private ksq (per-calculation) ===
         val_ksq = 0.0j
         
         if iz == jz:
             if i <= iz:
-                val_f1 = 1.0 / alpw[i, b]
-                val_f2 = 1.0
-                val_f3 = alpw[i, b]
-                val_ksq = ksqw[i, b]
+                val_ksq = ksqw[i, b]  # Use calc index b
             else:
-                val_f1 = rhob[i, b] / alpb[i, b]
-                val_f2 = 1.0 / rhob[i, b]
-                val_f3 = alpb[i, b]
                 val_ksq = ksqb[i, b]
         elif iz > jz:
             if i > jz and i <= iz:
-                val_f1 = 1.0 / alpw[i, b]
-                val_f2 = 1.0
-                val_f3 = alpw[i, b]
                 val_ksq = ksqw[i, b]
-        else: # iz < jz
+        else:  # iz < jz
             if i > iz and i <= jz:
-                val_f1 = rhob[i, b] / alpb[i, b]
-                val_f2 = 1.0 / rhob[i, b]
-                val_f3 = alpb[i, b]
                 val_ksq = ksqb[i, b]
-                
-        # Write to global memory - coalesced access [i, b]
-        # Adjacent threads (varying b) write to adjacent memory locations
-        f1[i, b] = val_f1
-        f2[i, b] = val_f2
-        f3[i, b] = val_f3
+        
+        # Write to per-calculation array
         ksq[i, b] = val_ksq
 
 
@@ -202,10 +235,17 @@ def decompose_kernel_single(iz_arr, jz_arr, nz,
 
 
 def matrc_cuda_init_profiles(iz, jz, nz, f1, f2, f3, ksq, alpw, alpb, ksqw, ksqb,
-                              rhob, batch_size=1):
+                              rhob, batch_size=1, n_freqs=1):
     """
-    Initialize environment profiles (called once per range step, outside Padé loop).
-    Arrays: [Nz+2, Batch] for coalesced memory access.
+    Initialize environment profiles with broadcast indexing (Super-Batch architecture).
+    
+    Args:
+        f1, f2, f3: [Nz+2, N_env] - shared geometry
+        ksq: [Nz+2, N_calc] - per-calculation field
+        alpw, alpb, ksqw, ksqb, rhob: Environment and field arrays
+        iz, jz: [N_env] - bathymetry indices (CuPy arrays)
+        batch_size: N_env (environment batch size)
+        n_freqs: N_freq (frequencies per environment)
     
     Note: iz and jz must be CuPy arrays (CuPyRAM is GPU-only).
     """
@@ -213,12 +253,16 @@ def matrc_cuda_init_profiles(iz, jz, nz, f1, f2, f3, ksq, alpw, alpb, ksqw, ksqb
     assert isinstance(iz, cupy.ndarray), "iz must be CuPy array"
     assert isinstance(jz, cupy.ndarray), "jz must be CuPy array"
 
-    # Init Profiles (Occupancy: Batch * Nz)
-    total_threads = batch_size * (nz + 2)
+    # Calculate total calculations (N_calc = N_env * N_freq)
+    calc_batch_size = batch_size * n_freqs
+    
+    # Init Profiles (Occupancy: N_calc * Nz)
+    total_threads = calc_batch_size * (nz + 2)
     block_size = 256
     grid_size = (total_threads + block_size - 1) // block_size
     init_profiles_kernel[grid_size, block_size](
-        iz, jz, nz, f1, f2, f3, ksq, alpw, alpb, ksqw, ksqb, rhob, batch_size
+        iz, jz, nz, f1, f2, f3, ksq, alpw, alpb, ksqw, ksqb, rhob,
+        batch_size, calc_batch_size, n_freqs
     )
 
 

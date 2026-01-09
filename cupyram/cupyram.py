@@ -235,7 +235,25 @@ class CuPyRAM:
         self._batch_size = kwargs.get('batch_size', 1)
         self._compute_grids = kwargs.get('compute_grids', True)  # Compute tlg/cpg grids (can be disabled to save VRAM)
         self._max_workers = kwargs.get('max_workers', 8)  # Parallel Padé computation
-        self._freq, self._zs, self._zr = freq, zs, zr
+        
+        # Normalize frequency to array (backward compatible with scalar input)
+        if numpy.isscalar(freq):
+            self._freqs = numpy.array([freq], dtype=numpy.float64)
+        else:
+            self._freqs = numpy.array(freq, dtype=numpy.float64).flatten()
+        
+        self._n_freq = len(self._freqs)
+        self._n_env = self._batch_size  # Original batch size = environments
+        self._total_batch = self._n_env * self._n_freq  # Total calculations
+        
+        # Log multi-frequency mode
+        if self._n_freq > 1:
+            max_freq = numpy.max(self._freqs)
+            min_freq = numpy.min(self._freqs)
+            print(f"Multi-frequency mode: {self._n_freq} frequencies [{min_freq:.1f}-{max_freq:.1f} Hz]")
+            print(f"  N_env={self._n_env}, N_freq={self._n_freq}, N_calc={self._total_batch}")
+        
+        self._zs, self._zr = zs, zr
         
         # Normalize all inputs to batched numpy arrays [batch_size, ...]
         # Provides backward compatibility with PyRAM API (single arrays → auto-batched)
@@ -311,17 +329,40 @@ class CuPyRAM:
             self.tlg = None
             self.cpg = None
         
-        # PyRAM API compatibility: squeeze batch dimension for batch_size=1
-        # Input: single arrays → normalized to [1, ...]
-        # Output: [1, ...] → squeezed back to single arrays
-        if self._batch_size == 1:
-            self.tll = self.tll[0] if self.tll.ndim > 1 else self.tll
-            self.cpl = self.cpl[0] if self.cpl.ndim > 1 else self.cpl
-            
-            # Only squeeze grids if they were computed
+        # Reshape output from [N_calc, ...] to [N_env, N_freq, ...]
+        # ALWAYS reshape, regardless of _n_freq value
+        # tll: [N_calc, nvr] -> [N_env, N_freq, nvr]
+        self.tll = self.tll.reshape(self._n_env, self._n_freq, -1)
+        self.cpl = self.cpl.reshape(self._n_env, self._n_freq, -1)
+        
+        if self._compute_grids:
+            # tlg: [N_calc, nvz, nvr] -> [N_env, N_freq, nvz, nvr]
+            self.tlg = self.tlg.reshape(self._n_env, self._n_freq, 
+                                         self.tlg.shape[1], self.tlg.shape[2])
+            self.cpg = self.cpg.reshape(self._n_env, self._n_freq,
+                                         self.cpg.shape[1], self.cpg.shape[2])
+        
+        # PyRAM API compatibility: squeeze dimensions for single env/freq
+        if self._n_freq == 1 and self._n_env == 1:
+            # Single environment, single frequency: squeeze both dimensions
+            self.tll = self.tll[0, 0]
+            self.cpl = self.cpl[0, 0]
             if self._compute_grids:
-                self.tlg = self.tlg[0] if self.tlg.ndim > 2 else self.tlg
-                self.cpg = self.cpg[0] if self.cpg.ndim > 2 else self.cpg
+                self.tlg = self.tlg[0, 0]
+                self.cpg = self.cpg[0, 0]
+        elif self._n_freq == 1:
+            # Multiple environments, single frequency: squeeze freq dimension
+            self.tll = self.tll[:, 0, :]
+            self.cpl = self.cpl[:, 0, :]
+            if self._compute_grids:
+                self.tlg = self.tlg[:, 0, :, :]
+        elif self._n_env == 1:
+            # Single environment, multiple frequencies: squeeze env dimension
+            self.tll = self.tll[0, :, :]
+            self.cpl = self.cpl[0, :, :]
+            if self._compute_grids:
+                self.tlg = self.tlg[0, :, :, :]
+                self.cpg = self.cpg[:, 0, :, :]
 
         results = {'ID': self._id,
                    'Proc Time': self.proc_time,
@@ -436,11 +477,17 @@ class CuPyRAM:
             # Use mean c0 for shared parameters (dr, dz, lambda)
             self._c0 = numpy.mean(self._c0_array)
 
-        self._lambda = self._c0 / self._freq
+        # Use maximum frequency for grid resolution (conservative for all frequencies)
+        max_freq = numpy.max(self._freqs)
+        self._lambda = self._c0 / max_freq
 
-        # dr and dz based on 1500m/s for sensible output steps
-        self._dr = kwargs.get('dr', self._np * 1500 / self._freq)
-        self._dz = kwargs.get('dz', CuPyRAM._dzf * 1500 / self._freq)
+        # dr and dz based on 1500m/s for sensible output steps, using max frequency
+        self._dr = kwargs.get('dr', self._np * 1500 / max_freq)
+        self._dz = kwargs.get('dz', CuPyRAM._dzf * 1500 / max_freq)
+        
+        # Log grid resolution for multi-frequency mode
+        if self._n_freq > 1:
+            print(f"  Grid resolution: dr={self._dr:.1f}m, dz={self._dz:.3f}m (based on max_freq={max_freq:.1f} Hz)")
 
         self._ndr = kwargs.get('ndr', CuPyRAM._ndr_default)
         self._ndz = kwargs.get('ndz', CuPyRAM._ndz_default)
@@ -516,14 +563,9 @@ class CuPyRAM:
         self.ib = [0] * self._batch_size  # Bathymetry pair index per ray
         self.mdr = 0  # Output range counter
         self.r = self._dr
-        self.omega = 2 * numpy.pi * self._freq
         ri = self._zr / self._dz
         self.ir = int(numpy.floor(ri))  # Receiver depth index
         self.dir = ri - self.ir  # Offset
-        
-        # Compute per-ray k0 values on CPU then transfer to GPU
-        self.k0 = self.omega / self._c0_array  # Array [batch_size]
-        self.k0 = cupy.asarray(self.k0)
         
         # Adjust seabed depths relative to deepest water profile point (per-ray)
         for i in range(self._batch_size):
@@ -540,109 +582,129 @@ class CuPyRAM:
         z_sb_cpu = cupy.asnumpy(self._z_sb)
         zmax_sb = max(numpy.nanmax(z_sb[:z_sb_len]) 
                       for z_sb, (_, z_sb_len) in 
-                      zip(z_sb_cpu, [self._get_valid_slice(z_sb_cpu[i]) for i in range(self._batch_size)]))
+                      zip(z_sb_cpu, [self._get_valid_slice(z_sb_cpu[i]) for i in range(self._n_env)]))
         
         self._zmax = zmax_sb + self._lyrw * self._lambda
         self.nz = int(numpy.floor(self._zmax / self._dz)) - 1  # Number of depth grid points - 2
         self.nzplt = int(numpy.floor(self._zmplt / self._dz))  # Deepest output grid point
         
-        # Initial bathymetry index (per-ray) - use valid portions only
+        # Initial bathymetry index (per-environment) - use valid portions only
         iz_list = []
-        for i in range(self._batch_size):
+        for i in range(self._n_env):
             rbzb_valid, _ = self._get_valid_slice(self._rbzb[i])
             iz_val = int(numpy.floor(rbzb_valid[0, 1] / self._dz))
             iz_list.append(max(1, min(self.nz - 1, iz_val)))
         
-        # Create on GPU
+        # Create on GPU [N_env]
         self.iz = cupy.array(iz_list, dtype=cupy.int64)
 
-        # Allocate batched arrays [Nz+2, Batch] for coalesced memory access
-        # All arrays transposed: adjacent threads (varying batch) access adjacent memory
-        # u and v are GPU-native (CuPy) - solution vectors in DOUBLE PRECISION
-        self.u = cupy.zeros([self.nz + 2, self._batch_size], dtype=numpy.complex128)  # GPU (double precision)
-        self.v = cupy.zeros([self.nz + 2, self._batch_size], dtype=numpy.complex128)  # GPU (double precision)
+        # === SUPER-BATCH ARCHITECTURE: Split arrays by frequency dependence ===
+        # Environment-tied arrays [Nz+2, N_env]: geometry and raw medium properties
+        # Field-tied arrays [Nz+2, N_calc]: acoustic fields and frequency-dependent terms
         
-        # SINGLE PRECISION intermediate arrays (recomputed each step, not accumulated)
-        # Memory savings: ~50% reduction in VRAM for these arrays
-        self.ksq = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # GPU (single precision)
+        # Environment-tied arrays [Nz+2, N_env] - SINGLE PRECISION
+        # Geometry (frequency-independent)
+        self.f1 = cupy.zeros([self.nz + 2, self._n_env], dtype=cupy.float32)
+        self.f2 = cupy.zeros([self.nz + 2, self._n_env], dtype=cupy.float32)
+        self.f3 = cupy.zeros([self.nz + 2, self._n_env], dtype=cupy.float32)
+        # Raw medium properties
+        self.cw = cupy.zeros([self.nz + 2, self._n_env], dtype=cupy.float32)
+        self.cb = cupy.zeros([self.nz + 2, self._n_env], dtype=cupy.float32)
+        self.rhob = cupy.zeros([self.nz + 2, self._n_env], dtype=cupy.float32)
+        self.attn = cupy.zeros([self.nz + 2, self._n_env], dtype=cupy.float32)
+        # Acoustic impedance terms (frequency-independent)
+        self.alpw = cupy.zeros([self.nz + 2, self._n_env], dtype=cupy.float32)
+        self.alpb = cupy.zeros([self.nz + 2, self._n_env], dtype=cupy.float32)
         
-        # Matrix coefficients [Nz+2, Batch] - conditional allocation based on kernel type
+        # Field-tied arrays [Nz+2, N_calc] - Acoustic fields and frequency-dependent terms
+        # Solution vectors in DOUBLE PRECISION
+        self.u = cupy.zeros([self.nz + 2, self._total_batch], dtype=numpy.complex128)
+        self.v = cupy.zeros([self.nz + 2, self._total_batch], dtype=numpy.complex128)
+        
+        # Wavenumber-dependent arrays in SINGLE PRECISION
+        self.ksq = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.complex64)
+        # CRITICAL: ksqw and ksqb depend on frequency (omega) - must be N_calc
+        self.ksqw = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.float32)
+        self.ksqb = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.complex64)
+        
+        # Workspace arrays [Nz+2, N_calc] - conditional allocation based on kernel type
         if FUSED_KERNEL:
-            # Optimized fused kernel: Only 2 workspace arrays (67% memory reduction)
-            self.tdma_upper = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-            self.tdma_rhs = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-            # No r1-r3, s1-s3 allocation (computed on-the-fly in kernel)
+            # Optimized fused kernel: Only 2 workspace arrays
+            self.tdma_upper = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.complex64)
+            self.tdma_rhs = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.complex64)
         else:
             # Legacy product formulation: 6 arrays
-            self.r1 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-            self.r2 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-            self.r3 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-            self.s1 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-            self.s2 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-            self.s3 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
+            self.r1 = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.complex64)
+            self.r2 = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.complex64)
+            self.r3 = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.complex64)
+            self.s1 = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.complex64)
+            self.s2 = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.complex64)
+            self.s3 = cupy.zeros([self.nz + 2, self._total_batch], dtype=cupy.complex64)
         
-        # Per-ray Padé coefficients [np, batch_size] on GPU (transposed for coalesced access)
-        # Keep double precision for accuracy (mathematical constants)
-        self.pd1 = cupy.zeros([self._np, self._batch_size], dtype=cupy.complex128)
-        self.pd2 = cupy.zeros([self._np, self._batch_size], dtype=cupy.complex128)
-
-        # Per-ray environment arrays [Nz+2, Batch] on GPU - transposed for coalescing
-        self.alpw = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.float32)  # SINGLE PRECISION
-        self.alpb = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.float32)  # SINGLE PRECISION
-        self.ksqw = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.float32)  # SINGLE PRECISION
-        self.ksqb = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.complex64)  # SINGLE PRECISION
-        self.cw = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.float32)  # SINGLE PRECISION
-        self.cb = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.float32)  # SINGLE PRECISION
-        self.rhob = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.float32)  # SINGLE PRECISION
-        self.attn = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.float32)  # SINGLE PRECISION
+        # Padé coefficients [np, N_calc] - DOUBLE PRECISION for accuracy
+        self.pd1 = cupy.zeros([self._np, self._total_batch], dtype=cupy.complex128)
+        self.pd2 = cupy.zeros([self._np, self._total_batch], dtype=cupy.complex128)
         
-        # Batched working arrays [Nz+2, Batch] on GPU
-        # Transposed for coalesced memory access in matrc_cuda
-        self.f1 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.float32)  # SINGLE PRECISION
-        self.f2 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.float32)  # SINGLE PRECISION
-        self.f3 = cupy.zeros([self.nz + 2, self._batch_size], dtype=cupy.float32)  # SINGLE PRECISION
+        # Precompute k0 array [N_calc] - broadcast frequencies and c0 values
+        # Order: [env0_freq0, env0_freq1, ..., env0_freqN, env1_freq0, ...]
+        omegas = 2 * numpy.pi * self._freqs  # [N_freq]
+        omegas_tiled = numpy.tile(omegas, self._n_env)  # [N_calc]
+        c0_repeated = numpy.repeat(self._c0_array, self._n_freq)  # [N_calc]
+        self.k0 = cupy.asarray(omegas_tiled / c0_repeated)
+        
         nvr = int(numpy.floor(self._rmax / (self._dr * self._ndr)))
         self._rmax = nvr * self._dr * self._ndr
         nvz = int(numpy.floor(self.nzplt / self._ndz))
         self.vr = numpy.arange(1, nvr + 1) * self._dr * self._ndr
         self.vz = numpy.arange(1, nvz + 1) * self._dz * self._ndz
         
-        # Batched output arrays [batch_size, ...] on GPU
+        # Output arrays [N_calc, ...] on GPU
         # Grid outputs (tlg, cpg) can be disabled to save VRAM
         if self._compute_grids:
-            # Full grid output
             nvz_alloc = nvz
         else:
-            # Minimal dummy arrays (1x1 grid) when grids are disabled
             nvz_alloc = 1
         
-        # Allocate directly on GPU VRAM
-        self.tll = cupy.zeros([self._batch_size, nvr], dtype=numpy.float64)
-        self.tlg = cupy.zeros([self._batch_size, nvz_alloc, nvr], dtype=numpy.float64)
-        self.cpl = cupy.zeros([self._batch_size, nvr], dtype=numpy.complex128)
-        self.cpg = cupy.zeros([self._batch_size, nvz_alloc, nvr], dtype=numpy.complex128)
+        # Allocate output arrays for N_calc (will be reshaped to [N_env, N_freq, ...] in run())
+        self.tll = cupy.zeros([self._total_batch, nvr], dtype=numpy.float64)
+        self.tlg = cupy.zeros([self._total_batch, nvz_alloc, nvr], dtype=numpy.float64)
+        self.cpl = cupy.zeros([self._total_batch, nvr], dtype=numpy.complex128)
+        self.cpg = cupy.zeros([self._total_batch, nvz_alloc, nvr], dtype=numpy.complex128)
         
         self.tlc = -1  # TL output range counter
 
-        # Per-ray profile range indices on GPU for parallel updates
-        self.ss_ind = cupy.zeros(self._batch_size, dtype=cupy.int32)
-        self.sb_ind = cupy.zeros(self._batch_size, dtype=cupy.int32)
-        self.bt_ind = cupy.zeros(self._batch_size, dtype=cupy.int32)
+        # Per-environment profile range indices [N_env] on GPU
+        self.ss_ind = cupy.zeros(self._n_env, dtype=cupy.int32)
+        self.sb_ind = cupy.zeros(self._n_env, dtype=cupy.int32)
+        self.bt_ind = cupy.zeros(self._n_env, dtype=cupy.int32)
 
         # The initial profiles and starting field
         self.profl()
         self.selfs()  # Initialize acoustic field on GPU
         self.mdr, self.tlc = self._outpt()
 
-        # Compute per-ray Padé coefficients in parallel on CPU, transfer to GPU
+        # Compute Padé coefficients per (env, freq) pair
         with nvtx.annotate("compute_pade_batch", color="purple"):
-            pd1_batch, pd2_batch = compute_pade_coefficients_batch(
-                freq=self._freq, c0_array=self._c0_array, 
-                np_pade=self._np, ns=self._ns, 
-                dr=self._dr, ip=1, max_workers=self._max_workers
-            )
-            self.pd1 = cupy.asarray(pd1_batch)  # Transfer to GPU: [np, batch]
-            self.pd2 = cupy.asarray(pd2_batch)
+            pd1_list = []
+            pd2_list = []
+            
+            # Order: [env0_freq0, env0_freq1, ..., env0_freqN, env1_freq0, ...]
+            for env_idx in range(self._n_env):
+                for freq_idx in range(self._n_freq):
+                    pd1, pd2 = compute_pade_coefficients(
+                        freq=self._freqs[freq_idx],
+                        c0=self._c0_array[env_idx],
+                        np_pade=self._np, ns=self._ns, 
+                        dr=self._dr, ip=1
+                    )
+                    pd1_list.append(pd1)
+                    pd2_list.append(pd2)
+            
+            # Stack and transfer to GPU: [N_calc, np] -> transpose to [np, N_calc]
+            pd1_stacked = numpy.array(pd1_list)  # [N_calc, np]
+            pd2_stacked = numpy.array(pd2_list)
+            self.pd1 = cupy.asarray(pd1_stacked.T)  # [np, N_calc]
+            self.pd2 = cupy.asarray(pd2_stacked.T)
 
     @nvtx.annotate("CuPyRAM.profl", color="cyan")
     def profl(self):
@@ -657,22 +719,21 @@ class CuPyRAM:
         z = cupy.linspace(0, self._zmax, self.nz + 2)
         
         # CPU-GPU STREAMING: Slice active profiles on CPU, transfer small slice to GPU
-        # Get active indices from GPU to CPU
+        # Get active indices from GPU to CPU (N_env size)
         with nvtx.annotate("get_active_indices", color="yellow"):
             ss_ind_cpu = cupy.asnumpy(self.ss_ind)
             sb_ind_cpu = cupy.asnumpy(self.sb_ind)
-            batch_indices_cpu = numpy.arange(self._batch_size)
+            batch_indices_cpu = numpy.arange(self._n_env)
         
         # SLICE ON CPU (Host RAM) - environment arrays are still NumPy
-        # Extract only the current active profile for each ray: [Batch, Nz_in]
+        # Extract only the current active profile for each environment: [N_env, Nz_in]
         with nvtx.annotate("slice_profiles_cpu", color="orange"):
             current_cw_prof_cpu = self._cw[batch_indices_cpu, :, ss_ind_cpu]
             current_cb_prof_cpu = self._cb[batch_indices_cpu, :, sb_ind_cpu]
             current_rhob_prof_cpu = self._rhob[batch_indices_cpu, :, sb_ind_cpu]
             current_attn_prof_cpu = self._attn[batch_indices_cpu, :, sb_ind_cpu]
         
-        # TRANSFER TO GPU (PCIe) - only the active slice (~80 MB vs GBs)
-        # Transfer time: ~2-3 ms on PCIe Gen4, negligible compared to computation
+        # TRANSFER TO GPU (PCIe) - only the active slice
         with nvtx.annotate("transfer_profiles_to_gpu", color="green"):
             current_cw_prof_gpu = cupy.asarray(current_cw_prof_cpu)
             current_cb_prof_gpu = cupy.asarray(current_cb_prof_cpu)
@@ -683,11 +744,10 @@ class CuPyRAM:
         z_ss_gpu = self._z_ss
         z_sb_gpu = self._z_sb
         
-        # Pre-calculate absorbing layer width per ray
-        # self._lyrw and self._lambda are scalars, so this is always a float
-        lyrw_lambda_arr = cupy.full(self._batch_size, self._lyrw * self._lambda)
+        # Pre-calculate absorbing layer width per environment
+        lyrw_lambda_arr = cupy.full(self._n_env, self._lyrw * self._lambda)
             
-        # Run batched interpolation kernel on GPU
+        # Run batched interpolation kernel on GPU (N_env profiles)
         profl_cuda_launcher(
             z, z_ss_gpu, current_cw_prof_gpu, 
             z_sb_gpu, current_cb_prof_gpu, current_rhob_prof_gpu, current_attn_prof_gpu,
@@ -695,20 +755,35 @@ class CuPyRAM:
             lyrw_lambda_arr, attnf=10.0
         )
         
-        # Compute derived quantities (vectorized on GPU)
-        # Arrays are [Nz+2, Batch], need to broadcast k0_sq and c0_ray correctly
-        k0_sq = self.k0**2
-        if k0_sq.ndim == 1:
-            k0_sq = k0_sq[None, :]  # Broadcast to [1, Batch] for [Nz+2, Batch] arrays
-            
+        # === STEP 2: Compute frequency-independent derived quantities (N_env) ===
         # self._c0_array is always NumPy array (created in get_params())
-        c0_ray = cupy.asarray(self._c0_array)[None, :]
+        c0_ray = cupy.asarray(self._c0_array)[None, :]  # [1, N_env]
         
-        self.ksqw = (self.omega / self.cw)**2 - k0_sq
-        term = (self.omega / self.cb) * (1 + 1j * self.eta * self.attn)
-        self.ksqb = term**2 - k0_sq
-        self.alpw = cupy.sqrt(self.cw / c0_ray)
-        self.alpb = cupy.sqrt(self.rhob * self.cb / c0_ray)
+        # Acoustic impedance terms (frequency-independent)
+        self.alpw = cupy.sqrt(self.cw / c0_ray)  # [Nz+2, N_env]
+        self.alpb = cupy.sqrt(self.rhob * self.cb / c0_ray)  # [Nz+2, N_env]
+        
+        # === STEP 3: Compute frequency-dependent ksqw, ksqb (N_calc) ===
+        # Broadcast environment arrays [Nz+2, N_env] -> [Nz+2, N_calc]
+        with nvtx.annotate("expand_frequency_dependent", color="magenta"):
+            cw_expanded = cupy.repeat(self.cw, self._n_freq, axis=1)  # [Nz+2, N_calc]
+            cb_expanded = cupy.repeat(self.cb, self._n_freq, axis=1)
+            attn_expanded = cupy.repeat(self.attn, self._n_freq, axis=1)
+            
+            # Broadcast k0 [N_calc] to [1, N_calc]
+            k0_sq = self.k0**2  # [N_calc]
+            if k0_sq.ndim == 1:
+                k0_sq = k0_sq[None, :]  # [1, N_calc]
+            
+            # Broadcast omega [N_calc] to [1, N_calc]
+            omegas = 2 * numpy.pi * self._freqs  # [N_freq]
+            omegas_tiled = numpy.tile(omegas, self._n_env)  # [N_calc]
+            omega_arr = cupy.asarray(omegas_tiled)[None, :]  # [1, N_calc]
+            
+            # Compute wavenumber terms [Nz+2, N_calc]
+            self.ksqw = (omega_arr / cw_expanded)**2 - k0_sq
+            term = (omega_arr / cb_expanded) * (1 + 1j * self.eta * attn_expanded)
+            self.ksqb = term**2 - k0_sq
 
     @nvtx.annotate("CuPyRAM._propagate_step", color="red")
     def _propagate_step(self):
@@ -723,13 +798,14 @@ class CuPyRAM:
         """
         
         if FUSED_KERNEL:
-            # === OPTIMIZED: Fused Sum-Padé Kernel ===
+            # === OPTIMIZED: Fused Sum-Padé Kernel with Super-Batch ===
             # Initialize environment (once per range step)
             with nvtx.annotate("init_profiles", color="purple"):
                 matrc_cuda_init_profiles(
                     self.iz, self.iz, self.nz, self.f1, self.f2, self.f3, self.ksq,
                     self.alpw, self.alpb, self.ksqw, self.ksqb, self.rhob,
-                    batch_size=self._batch_size
+                    batch_size=self._n_env,  # Environment arrays are N_env size
+                    n_freqs=self._n_freq     # For ksq expansion to N_calc
                 )
             
             # Fused kernel: all Padé terms with on-the-fly matrix generation
@@ -741,22 +817,24 @@ class CuPyRAM:
                     self.k0, self._dz, self.iz, self.nz,
                     self.pd1, self.pd2,
                     self.tdma_upper, self.tdma_rhs,
-                    self._batch_size
+                    self._total_batch,  # N_calc calculations
+                    self._n_freq        # For broadcast indexing
                 )
         else:
-            # === LEGACY: Product Formulation ===
+            # === LEGACY: Product Formulation with Super-Batch ===
             # Step 1: Init profiles (once per range step, outside Padé loop)
             with nvtx.annotate("init_profiles", color="purple"):
                 matrc_cuda_init_profiles(
                     self.iz, self.iz, self.nz, self.f1, self.f2, self.f3, self.ksq,
                     self.alpw, self.alpb, self.ksqw, self.ksqb, self.rhob,
-                    batch_size=self._batch_size
+                    batch_size=self._n_env,
+                    n_freqs=self._n_freq
                 )
             
             # Step 2: Loop over Padé coefficients
             for j in range(self._np):
-                # Extract Padé coefficients for this j: [Batch] slice (COALESCED!)
-                pd1_vals = self.pd1[j, :]  # Row access on [np, batch] → coalesced
+                # Extract Padé coefficients for this j: [N_calc] slice (COALESCED!)
+                pd1_vals = self.pd1[j, :]  # Row access on [np, N_calc] → coalesced
                 pd2_vals = self.pd2[j, :]
                 
                 # Discretize and decompose for this Padé term
@@ -765,7 +843,7 @@ class CuPyRAM:
                         self.k0, self._dz, self.iz, self.iz, self.nz,
                         self.f1, self.f2, self.f3, self.ksq,
                         self.r1, self.r2, self.r3, self.s1, self.s2, self.s3,
-                        pd1_vals, pd2_vals, batch_size=self._batch_size
+                        pd1_vals, pd2_vals, batch_size=self._total_batch
                     )
                 
                 # Solve for this Padé term
@@ -779,20 +857,24 @@ class CuPyRAM:
             # Wrap u for Numba CUDA (zero-copy, u is already CuPy on GPU)
             u_device = cuda.as_cuda_array(self.u)
             
+            # Broadcast f3 [N_env] for output [N_calc]
+            # f3 is [Nz+2, N_env], need to repeat for N_calc
+            f3_expanded = cupy.repeat(self.f3, self._n_freq, axis=1)  # [Nz+2, N_calc]
+            
             # Output arrays are already CuPy (allocated in setup)
             result = outpt_cuda(self.r, self.mdr, self._ndr, self._ndz, self.tlc,
-                               self.f3, u_device, self.dir, self.ir,
+                               f3_expanded, u_device, self.dir, self.ir,
                                self.tll, self.tlg, self.cpl, self.cpg,
-                               batch_size=self._batch_size)
+                               batch_size=self._total_batch)
         return result
 
     @nvtx.annotate("CuPyRAM.updat", color="yellow")
     def updat(self):
         """
         Update matrices for range-dependent environment.
-        Index updates run in parallel on GPU via CUDA kernel.
+        Index updates run in parallel on GPU via CUDA kernel (per-environment).
         """
-        # Run parallel index updates on GPU
+        # Run parallel index updates on GPU (N_env environments)
         with nvtx.annotate("updat_indices_cuda", color="olive"):
             need_matrc = updat_indices_cuda(
                 float(self.r), float(self._dr), float(self._dz), int(self.nz),
@@ -800,47 +882,64 @@ class CuPyRAM:
                 self._rp_ss, self.ss_ind,
                 self._rp_sb, self.sb_ind,
                 bool(self.rd_bt), bool(self.rd_ss), bool(self.rd_sb),
-                self._batch_size
+                self._n_env  # Environment batch size
             )
             # Note: iz is updated in-place on GPU by updat_indices_cuda
         
-        # If any ray needs update, recompute profiles
+        # If any environment needs update, recompute profiles
         # Matrices will be computed in _propagate_step()
         if need_matrc:
             self.profl()
 
-        # Turn off the stability constraints (shared across all rays)
+        # Turn off the stability constraints (shared across all calculations)
+        # Note: This uses single frequency for simplicity (conservative)
         if self.r >= self._rs:
             self._ns = 0
             self._rs = self._rmax + self._dr
             with nvtx.annotate("compute_pade_stability", color="purple"):
-                pd1_new, pd2_new = compute_pade_coefficients(
-                    freq=self._freq, c0=self._c0, np_pade=self._np,
-                    ns=self._ns, dr=self._dr, ip=1
-                )
-                # Update Padé coefficients for all rays (broadcast to GPU)
-                # Shape: [np] → [np, 1] → broadcast to [np, batch_size]
-                self.pd1[:, :] = cupy.asarray(pd1_new)[:, None]
-                self.pd2[:, :] = cupy.asarray(pd2_new)[:, None]
+                # Recompute for all (env, freq) pairs
+                pd1_list = []
+                pd2_list = []
+                
+                for env_idx in range(self._n_env):
+                    for freq_idx in range(self._n_freq):
+                        pd1, pd2 = compute_pade_coefficients(
+                            freq=self._freqs[freq_idx],
+                            c0=self._c0_array[env_idx],
+                            np_pade=self._np, ns=self._ns, 
+                            dr=self._dr, ip=1
+                        )
+                        pd1_list.append(pd1)
+                        pd2_list.append(pd2)
+                
+                # Update Padé coefficients for all calculations
+                pd1_stacked = numpy.array(pd1_list)
+                pd2_stacked = numpy.array(pd2_list)
+                self.pd1[:, :] = cupy.asarray(pd1_stacked.T)
+                self.pd2[:, :] = cupy.asarray(pd2_stacked.T)
 
     @nvtx.annotate("CuPyRAM.selfs", color="magenta")
     def selfs(self):
         """
-        The self-starter. Initialize acoustic field for all rays.
-        Arrays: [Nz+2, Batch] for coalesced memory access.
+        The self-starter. Initialize acoustic field for all calculations.
+        Arrays: u [Nz+2, N_calc], alpw [Nz+2, N_env], k0 [N_calc]
         """
         # Conditions for the delta function
         si = self._zs / self._dz
         _is = int(numpy.floor(si))  # Source depth index
         dis = si - _is  # Offset
 
-        # Initialize u for all rays in batch (same source position for all)
-        # Vectorized GPU operation - no loops, no transfers
-        # u, alpw, k0 are all CuPy arrays on GPU [Nz+2, Batch] or [Batch]
+        # Initialize u for all calculations (same source position for all)
+        # Need to broadcast alpw [N_env] for u [N_calc]
+        # env_indices maps calc_idx -> env_idx
+        env_indices = cupy.arange(self._total_batch) // self._n_freq  # [N_calc]
+        
+        # Vectorized GPU operation with broadcasting
+        # u: [Nz+2, N_calc], k0: [N_calc], alpw: [Nz+2, N_env] -> broadcast via env_indices
         self.u[_is, :] = (1 - dis) * cupy.sqrt(2 * cupy.pi / self.k0) / \
-            (self._dz * self.alpw[_is, :])
+            (self._dz * self.alpw[_is, env_indices])
         self.u[_is + 1, :] = dis * cupy.sqrt(2 * cupy.pi / self.k0) / \
-            (self._dz * self.alpw[_is + 1, :])
+            (self._dz * self.alpw[_is + 1, env_indices])
 
         # Divide the delta function by (1-X)**2 to get a smooth rhs
         self.pd1[0, :] = 0  # First Padé coefficient for all batches
@@ -857,15 +956,28 @@ class CuPyRAM:
         # Restore np and apply full operator (1-X)**2*(1+X)**(-1/4)*exp(ci*k0*r*sqrt(1+X))
         self._np = old_np
         
-        # Compute per-ray Padé coefficients in parallel on CPU, transfer to GPU
+        # Compute Padé coefficients per (env, freq) pair
         with nvtx.annotate("compute_pade_batch_selfs", color="purple"):
-            pd1_batch, pd2_batch = compute_pade_coefficients_batch(
-                freq=self._freq, c0_array=self._c0_array, 
-                np_pade=self._np, ns=self._ns, 
-                dr=self._dr, ip=2, max_workers=self._max_workers
-            )
-            self.pd1 = cupy.asarray(pd1_batch)  # Transfer to GPU: [np, batch]
-            self.pd2 = cupy.asarray(pd2_batch)
+            pd1_list = []
+            pd2_list = []
+            
+            # Order: [env0_freq0, env0_freq1, ..., env0_freqN, env1_freq0, ...]
+            for env_idx in range(self._n_env):
+                for freq_idx in range(self._n_freq):
+                    pd1, pd2 = compute_pade_coefficients(
+                        freq=self._freqs[freq_idx],
+                        c0=self._c0_array[env_idx],
+                        np_pade=self._np, ns=self._ns, 
+                        dr=self._dr, ip=2
+                    )
+                    pd1_list.append(pd1)
+                    pd2_list.append(pd2)
+            
+            # Stack and transfer to GPU: [N_calc, np] -> transpose to [np, N_calc]
+            pd1_stacked = numpy.array(pd1_list)  # [N_calc, np]
+            pd2_stacked = numpy.array(pd2_list)
+            self.pd1 = cupy.asarray(pd1_stacked.T)  # [np, N_calc]
+            self.pd2 = cupy.asarray(pd2_stacked.T)
         
         # Apply full Padé operator
         self._propagate_step()

@@ -18,52 +18,50 @@ from numba import cuda, complex128
 
 
 @cuda.jit(device=True, inline=True)
-def compute_galerkin_coeffs(i, b, f1, f2, f3, ksq, k0, dz, pd1_val, pd2_val):
+def compute_galerkin_coeffs(i, calc_idx, env_idx, f1, f2, f3, ksq, k0, dz, pd1_val, pd2_val):
     """
-    Compute tridiagonal matrix coefficients on-the-fly in registers.
+    Compute tridiagonal matrix coefficients with broadcast indexing.
     
-    Port from matrc.py discretize_kernel_single (lines 123-150).
-    Implements Galerkin finite element discretization of the parabolic equation.
+    Implements Galerkin finite element discretization with Super-Batch architecture:
+    - Read f1/f2/f3 using env_idx (shared geometry across frequencies)
+    - Read ksq using calc_idx (frequency-dependent)
     
     Args:
         i: depth index (1..nz)
-        b: batch index
-        f1, f2, f3, ksq: environment arrays [Nz+2, Batch]
+        calc_idx: calculation index (field data) [0..N_calc-1]
+        env_idx: environment index (geometry data) [0..N_env-1]
+        f1, f2, f3: [Nz+2, N_env] - environment arrays (shared)
+        ksq: [Nz+2, N_calc] - field array (frequency-dependent)
         k0: wavenumber (scalar)
         dz: depth step (scalar)
         pd1_val, pd2_val: Padé coefficients for current term (scalars)
     
     Returns:
         (r1, r2, r3, s1, s2, s3): Tridiagonal coefficients in registers
-            r1, r2, r3: LHS coefficients (lower diagonal, diagonal, upper diagonal)
-            s1, s2, s3: RHS coefficients (lower diagonal, diagonal, upper diagonal)
     """
     # Discretization constants
     cfact = 0.5 / (dz * dz)
     dfact = 1.0 / 12.0
     
-    # Galerkin discretization (finite element method)
-    # c1, c2, c3: contributions from derivative terms
-    c1 = cfact * f1[i, b] * (f2[i-1, b] + f2[i, b]) * f3[i-1, b]
-    c2 = -cfact * f1[i, b] * (f2[i-1, b] + 2.0*f2[i, b] + f2[i+1, b]) * f3[i, b]
-    c3 = cfact * f1[i, b] * (f2[i, b] + f2[i+1, b]) * f3[i+1, b]
+    # Galerkin discretization - read f1/f2/f3 with env_idx (shared geometry)
+    c1 = cfact * f1[i, env_idx] * (f2[i-1, env_idx] + f2[i, env_idx]) * f3[i-1, env_idx]
+    c2 = -cfact * f1[i, env_idx] * (f2[i-1, env_idx] + 2.0*f2[i, env_idx] + f2[i+1, env_idx]) * f3[i, env_idx]
+    c3 = cfact * f1[i, env_idx] * (f2[i, env_idx] + f2[i+1, env_idx]) * f3[i+1, env_idx]
     
-    # d1, d2, d3: total contributions including wavenumber terms
-    d1 = c1 + dfact * (ksq[i-1, b] + ksq[i, b])
-    d2 = c2 + dfact * (ksq[i-1, b] + 6.0*ksq[i, b] + ksq[i+1, b])
-    d3 = c3 + dfact * (ksq[i, b] + ksq[i+1, b])
+    # Wavenumber contributions - read ksq with calc_idx (frequency-dependent)
+    d1 = c1 + dfact * (ksq[i-1, calc_idx] + ksq[i, calc_idx])
+    d2 = c2 + dfact * (ksq[i-1, calc_idx] + 6.0*ksq[i, calc_idx] + ksq[i+1, calc_idx])
+    d3 = c3 + dfact * (ksq[i, calc_idx] + ksq[i+1, calc_idx])
     
     # Mass matrix contributions
     a1 = k0 * k0 / 6.0
     a2 = 2.0 * k0 * k0 / 3.0
     
     # Build tridiagonal coefficients
-    # LHS (r): uses pd2
     r1 = a1 + pd2_val * d1
     r2 = a2 + pd2_val * d2
     r3 = a1 + pd2_val * d3
     
-    # RHS (s): uses pd1
     s1 = a1 + pd1_val * d1
     s2 = a2 + pd1_val * d2
     s3 = a1 + pd1_val * d3
@@ -74,58 +72,63 @@ def compute_galerkin_coeffs(i, b, f1, f2, f3, ksq, k0, dz, pd1_val, pd2_val):
 @cuda.jit
 def fused_sum_pade_kernel(
     u_in, u_out,
-    f1, f2, f3, ksq,        # Environment [Nz+2, Batch]
+    f1, f2, f3, ksq,        # f1/f2/f3: [Nz+2, N_env], ksq: [Nz+2, N_calc]
     k0_arr, dz, iz_arr, nz,
-    pd1_vals, pd2_vals,     # Padé coefficients [n_pade, batch]
-    tdma_upper, tdma_rhs,   # Workspace [Nz+2, Batch] - ONLY 2 arrays
-    n_pade, batch_size
+    pd1_vals, pd2_vals,     # Padé coefficients [n_pade, N_calc]
+    tdma_upper, tdma_rhs,   # Workspace [Nz+2, N_calc]
+    n_pade, total_batch_size, n_freqs
 ):
     """
-    Fused Padé kernel with unidirectional TDMA and on-the-fly matrix generation.
-    One thread per ray (batch dimension).
+    Fused Padé kernel with broadcast indexing (Super-Batch architecture).
+    One thread per calculation (N_calc total threads).
     
-    Uses PRODUCT formulation (same as legacy) but with on-the-fly matrix computation:
-        u_out = Op_N * ... * Op_1 * u_in
-    where each Op_j is applied sequentially but matrices are computed on-the-fly.
+    Uses PRODUCT formulation with broadcast indexing:
+    - Read f1/f2/f3 using env_idx (shared geometry across frequencies)
+    - Read u/ksq/k0/pd using calc_idx (frequency-dependent)
     
     Memory: 2 workspace arrays (67% reduction vs legacy 6 arrays)
-    Bandwidth: Reads environment once per range step (vs N times in legacy)
+    Bandwidth: Reads environment once per range step (all frequencies share)
     Arithmetic intensity: 8x increase (reuse environment across N Padé terms)
     
     Args:
-        u_in: [Nz+2, Batch] - Input solution
-        u_out: [Nz+2, Batch] - Output solution
-        f1, f2, f3, ksq: [Nz+2, Batch] - Environment arrays
-        k0_arr: [Batch] - Wavenumber per ray
+        u_in, u_out: [Nz+2, N_calc] - Solution vectors
+        f1, f2, f3: [Nz+2, N_env] - Environment arrays (shared)
+        ksq: [Nz+2, N_calc] - Wavenumber field (frequency-dependent)
+        k0_arr: [N_calc] - Wavenumber per calculation
         dz: scalar - Depth step
-        iz_arr: [Batch] - Bathymetry index per ray
+        iz_arr: [N_env] - Bathymetry index per environment
         nz: int - Number of depth points
-        pd1_vals, pd2_vals: [n_pade, Batch] - Padé coefficients
-        tdma_upper, tdma_rhs: [Nz+2, Batch] - Workspace arrays
+        pd1_vals, pd2_vals: [n_pade, N_calc] - Padé coefficients
+        tdma_upper, tdma_rhs: [Nz+2, N_calc] - Workspace arrays
         n_pade: int - Number of Padé terms
-        batch_size: int - Number of rays
+        total_batch_size: int - N_calc (total calculations)
+        n_freqs: int - N_freq (for environment index mapping)
     """
-    b = cuda.grid(1)
-    if b >= batch_size:
+    b = cuda.grid(1)  # Calculation index [0..N_calc-1]
+    if b >= total_batch_size:
         return
     
-    iz = iz_arr[b]
-    k0 = k0_arr[b]
+    # Compute environment index from calculation index
+    env_idx = b // n_freqs  # Maps b -> environment
+    
+    # Per-environment bathymetry, per-calculation wavenumber
+    iz = iz_arr[env_idx]  # Read from N_env array
+    k0 = k0_arr[b]        # Read from N_calc array
     eps = complex128(1e-30)
     
     # Copy input to output (will be modified in-place)
     for i in range(nz + 2):
         u_out[i, b] = u_in[i, b]
     
-    # Loop over Padé terms (PRODUCT formulation - sequential application)
+    # Loop over Padé terms (PRODUCT formulation)
     for j in range(n_pade):
-        pd1_j = pd1_vals[j, b]
+        pd1_j = pd1_vals[j, b]  # Per-calculation Padé coefficient
         pd2_j = pd2_vals[j, b]
         
-        # === FORWARD SWEEP: Build RHS and perform Gaussian elimination ===
+        # === FORWARD SWEEP ===
         # First row (i=1)
         r1, r2, r3, s1, s2, s3 = compute_galerkin_coeffs(
-            1, b, f1, f2, f3, ksq, k0, dz, pd1_j, pd2_j
+            1, b, env_idx, f1, f2, f3, ksq, k0, dz, pd1_j, pd2_j
         )
         rhs = s1 * u_out[0, b] + s2 * u_out[1, b] + s3 * u_out[2, b] + eps
         tdma_upper[1, b] = r3 / r2
@@ -134,20 +137,17 @@ def fused_sum_pade_kernel(
         # Remaining rows (i=2..nz)
         for i in range(2, nz + 1):
             r1, r2, r3, s1, s2, s3 = compute_galerkin_coeffs(
-                i, b, f1, f2, f3, ksq, k0, dz, pd1_j, pd2_j
+                i, b, env_idx, f1, f2, f3, ksq, k0, dz, pd1_j, pd2_j
             )
             rhs = s1 * u_out[i-1, b] + s2 * u_out[i, b] + s3 * u_out[i+1, b] + eps
             
-            # Gaussian elimination (Thomas algorithm forward sweep)
             denom = r2 - r1 * tdma_upper[i-1, b]
             tdma_upper[i, b] = r3 / denom
             tdma_rhs[i, b] = (rhs - r1 * tdma_rhs[i-1, b]) / denom + eps
         
-        # === BACKWARD SWEEP: Solve (overwrite u_out) ===
-        # Last row
+        # === BACKWARD SWEEP ===
         u_out[nz, b] = tdma_rhs[nz, b]
         
-        # Remaining rows (backward substitution)
         for i in range(nz - 1, 0, -1):
             u_out[i, b] = tdma_rhs[i, b] - tdma_upper[i, b] * u_out[i+1, b] + eps
     
@@ -160,24 +160,26 @@ def fused_sum_pade_solve(
     k0, dz, iz, nz,
     pd1, pd2,
     tdma_upper, tdma_rhs,
-    batch_size
+    batch_size, n_freqs=1
 ):
     """
-    Launch fused Padé kernel.
+    Launch fused Padé kernel with broadcast indexing (Super-Batch architecture).
     
     Python launcher that wraps CuPy arrays for Numba CUDA and launches the kernel.
     
     Args:
-        u_in: [Nz+2, Batch] - Input solution (CuPy array)
-        u_out: [Nz+2, Batch] - Output solution (CuPy array, can be same as u_in)
-        f1, f2, f3, ksq: [Nz+2, Batch] - Environment arrays (CuPy)
-        k0: [Batch] - Wavenumber per ray (CuPy array)
+        u_in: [Nz+2, N_calc] - Input solution (CuPy array)
+        u_out: [Nz+2, N_calc] - Output solution (CuPy array, can be same as u_in)
+        f1, f2, f3: [Nz+2, N_env] - Environment arrays (CuPy, shared)
+        ksq: [Nz+2, N_calc] - Wavenumber field (CuPy, frequency-dependent)
+        k0: [N_calc] - Wavenumber per calculation (CuPy array)
         dz: scalar - Depth step
-        iz: [Batch] - Bathymetry index per ray (CuPy array)
+        iz: [N_env] - Bathymetry index per environment (CuPy array)
         nz: int - Number of depth points
-        pd1, pd2: [n_pade, Batch] - Padé coefficients (CuPy)
-        tdma_upper, tdma_rhs: [Nz+2, Batch] - Workspace arrays (CuPy)
-        batch_size: int - Number of rays
+        pd1, pd2: [n_pade, N_calc] - Padé coefficients (CuPy)
+        tdma_upper, tdma_rhs: [Nz+2, N_calc] - Workspace arrays (CuPy)
+        batch_size: int - N_calc (total calculations)
+        n_freqs: int - N_freq (for environment index mapping)
     
     Returns:
         None (modifies u_out in-place)
@@ -196,7 +198,7 @@ def fused_sum_pade_solve(
     tdma_upper_dev = cuda.as_cuda_array(tdma_upper)
     tdma_rhs_dev = cuda.as_cuda_array(tdma_rhs)
     
-    # Launch configuration: 1 thread per ray
+    # Launch configuration: 1 thread per calculation
     threads_per_block = min(256, batch_size)
     blocks_per_grid = (batch_size + threads_per_block - 1) // threads_per_block
     
@@ -209,6 +211,7 @@ def fused_sum_pade_solve(
             pd1_dev, pd2_dev,
             tdma_upper_dev, tdma_rhs_dev,
             pd1.shape[0],  # n_pade
-            batch_size
+            batch_size,    # total_batch_size (N_calc)
+            n_freqs        # n_freqs for index mapping
         )
 
