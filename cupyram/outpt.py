@@ -58,18 +58,28 @@ def outpt_kernel(r, mdr_in, ndr, ndz, tlc_in, f3, u, _dir, ir,
         tlc_out[0] = tlc
 
 
-def outpt_cuda(r, mdr, ndr, ndz, tlc, f3, u, _dir, ir, tll, tlg, cpl, cpg, batch_size=1):
+def outpt_cuda(r, mdr, ndr, ndz, tlc, f3, u, _dir, ir, tll, tlg, cpl, cpg, batch_size=1, 
+               mdr_gpu=None, tlc_gpu=None):
     """
     GPU-accelerated output computation using CUDA.
     
     All arrays should be CuPy arrays on the device.
     Launches batch_size threads.
     
-    Returns: [mdr, tlc] as numpy array (for compatibility)
+    Args:
+        mdr_gpu, tlc_gpu: Optional CuPy arrays for counters (kept on GPU to avoid D2H transfers)
+    
+    Returns: (mdr_gpu, tlc_gpu) as CuPy arrays (stay on GPU)
     """
     nvz = tlg.shape[1] if tlg.ndim == 3 else tlg.shape[0]
     
-    # Create device arrays for output counters
+    # Use provided GPU arrays or create new ones
+    if mdr_gpu is None:
+        mdr_gpu = cupy.array([mdr], dtype=cupy.int32)
+    if tlc_gpu is None:
+        tlc_gpu = cupy.array([tlc], dtype=cupy.int32)
+    
+    # Output arrays for updated counters
     mdr_out = cupy.zeros(1, dtype=cupy.int32)
     tlc_out = cupy.zeros(1, dtype=cupy.int32)
     
@@ -78,12 +88,10 @@ def outpt_cuda(r, mdr, ndr, ndz, tlc, f3, u, _dir, ir, tll, tlg, cpl, cpg, batch
     blocks_per_grid = (batch_size + threads_per_block - 1) // threads_per_block
     
     outpt_kernel[blocks_per_grid, threads_per_block](
-        r, mdr, ndr, ndz, tlc, f3, u, _dir, ir,
+        r, int(mdr_gpu[0]), ndr, ndz, int(tlc_gpu[0]), f3, u, _dir, ir,
         tll, tlg, cpl, cpg, mdr_out, tlc_out, batch_size, nvz
     )
     
-    # Copy counters back to host for return
-    import numpy
-    result = numpy.array([int(mdr_out.get().item()), int(tlc_out.get().item())], dtype=numpy.int64)
-    return result
+    # Return GPU arrays (no D2H transfer!)
+    return mdr_out, tlc_out
 

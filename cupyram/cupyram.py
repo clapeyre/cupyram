@@ -302,7 +302,9 @@ class CuPyRAM:
 
             self.r = (rn + 2) * self._dr
 
-            self.mdr, self.tlc = self._outpt()
+            # Only compute output if grids are enabled
+            if self._compute_grids:
+                self.mdr_gpu, self.tlc_gpu = self._outpt()
 
             # Sync every N steps (e.g., 50 or 100).
             # This makes the progress bar accurate with <0.1% overhead.
@@ -567,7 +569,8 @@ class CuPyRAM:
 
         self.eta = 1 / (40 * numpy.pi * numpy.log10(numpy.exp(1)))
         self.ib = [0] * self._batch_size  # Bathymetry pair index per ray
-        self.mdr = 0  # Output range counter
+        self.mdr_gpu = cupy.array([0], dtype=cupy.int32)  # Output range counter (on GPU)
+        self.mdr = 0  # Host copy for compatibility
         self.r = self._dr
         ri = self._zr / self._dz
         self.ir = int(numpy.floor(ri))  # Receiver depth index
@@ -658,6 +661,12 @@ class CuPyRAM:
         c0_repeated = numpy.repeat(self._c0_array, self._n_freq)  # [N_calc]
         self.k0 = cupy.asarray(omegas_tiled / c0_repeated)
         
+        # Cache omega_arr and k0_sq on GPU for profl() (avoids repeated CPU->GPU transfers)
+        self._omega_arr_cached = cupy.asarray(omegas_tiled)[None, :]  # [1, N_calc] on GPU
+        self._k0_sq_cached = self.k0**2
+        if self._k0_sq_cached.ndim == 1:
+            self._k0_sq_cached = self._k0_sq_cached[None, :]  # [1, N_calc]
+        
         nvr = int(numpy.floor(self._rmax / (self._dr * self._ndr)))
         self._rmax = nvr * self._dr * self._ndr
         nvz = int(numpy.floor(self.nzplt / self._ndz))
@@ -677,7 +686,8 @@ class CuPyRAM:
         self.cpl = cupy.zeros([self._total_batch, nvr], dtype=numpy.complex128)
         self.cpg = cupy.zeros([self._total_batch, nvz_alloc, nvr], dtype=numpy.complex128)
         
-        self.tlc = -1  # TL output range counter
+        self.tlc_gpu = cupy.array([-1], dtype=cupy.int32)  # TL output range counter (on GPU)
+        self.tlc = -1  # Host copy for compatibility
 
         # Per-environment profile range indices [N_env] on GPU
         self.ss_ind = cupy.zeros(self._n_env, dtype=cupy.int32)
@@ -687,7 +697,10 @@ class CuPyRAM:
         # The initial profiles and starting field
         self.profl()
         self.selfs()  # Initialize acoustic field on GPU
-        self.mdr, self.tlc = self._outpt()
+        
+        # Only compute output if grids are enabled
+        if self._compute_grids:
+            self.mdr_gpu, self.tlc_gpu = self._outpt()
 
         # Compute Padé coefficients per (env, freq) pair
         with nvtx.annotate("compute_pade_batch", color="purple"):
@@ -772,19 +785,21 @@ class CuPyRAM:
         # === STEP 3: Compute frequency-dependent ksqw, ksqb (N_calc) ===
         # Broadcast environment arrays [Nz+2, N_env] -> [Nz+2, N_calc]
         with nvtx.annotate("expand_frequency_dependent", color="magenta"):
-            cw_expanded = cupy.repeat(self.cw, self._n_freq, axis=1)  # [Nz+2, N_calc]
-            cb_expanded = cupy.repeat(self.cb, self._n_freq, axis=1)
-            attn_expanded = cupy.repeat(self.attn, self._n_freq, axis=1)
+            # Optimize: avoid unnecessary copies for single frequency
+            if self._n_freq == 1:
+                # No expansion needed - arrays are already correct shape
+                cw_expanded = self.cw
+                cb_expanded = self.cb
+                attn_expanded = self.attn
+            else:
+                # Multi-frequency: repeat environment arrays
+                cw_expanded = cupy.repeat(self.cw, self._n_freq, axis=1)  # [Nz+2, N_calc]
+                cb_expanded = cupy.repeat(self.cb, self._n_freq, axis=1)
+                attn_expanded = cupy.repeat(self.attn, self._n_freq, axis=1)
             
-            # Broadcast k0 [N_calc] to [1, N_calc]
-            k0_sq = self.k0**2  # [N_calc]
-            if k0_sq.ndim == 1:
-                k0_sq = k0_sq[None, :]  # [1, N_calc]
-            
-            # Broadcast omega [N_calc] to [1, N_calc]
-            omegas = 2 * numpy.pi * self._freqs  # [N_freq]
-            omegas_tiled = numpy.tile(omegas, self._n_env)  # [N_calc]
-            omega_arr = cupy.asarray(omegas_tiled)[None, :]  # [1, N_calc]
+            # Use cached GPU arrays (computed once in setup()) - avoids CPU->GPU transfer
+            omega_arr = self._omega_arr_cached
+            k0_sq = self._k0_sq_cached
             
             # Compute wavenumber terms [Nz+2, N_calc]
             self.ksqw = (omega_arr / cw_expanded)**2 - k0_sq
@@ -867,7 +882,11 @@ class CuPyRAM:
             self.propagation_time += process_time() - t_prop_start
     
     def _outpt(self):
-        """Compute transmission loss outputs on GPU using CUDA kernel."""
+        """Compute transmission loss outputs on GPU using CUDA kernel.
+        
+        Returns:
+            (mdr_gpu, tlc_gpu): CuPy arrays on GPU (no D2H transfer for performance)
+        """
         with nvtx.annotate("outpt_cuda", color="green"):
             # Wrap u for Numba CUDA (zero-copy, u is already CuPy on GPU)
             u_device = cuda.as_cuda_array(self.u)
@@ -877,11 +896,15 @@ class CuPyRAM:
             f3_expanded = cupy.repeat(self.f3, self._n_freq, axis=1)  # [Nz+2, N_calc]
             
             # Output arrays are already CuPy (allocated in setup)
-            result = outpt_cuda(self.r, self.mdr, self._ndr, self._ndz, self.tlc,
-                               f3_expanded, u_device, self.dir, self.ir,
-                               self.tll, self.tlg, self.cpl, self.cpg,
-                               batch_size=self._total_batch)
-        return result
+            # Pass GPU counters to avoid D2H transfers every iteration
+            mdr_gpu, tlc_gpu = outpt_cuda(
+                self.r, None, self._ndr, self._ndz, None,
+                f3_expanded, u_device, self.dir, self.ir,
+                self.tll, self.tlg, self.cpl, self.cpg,
+                batch_size=self._total_batch,
+                mdr_gpu=self.mdr_gpu, tlc_gpu=self.tlc_gpu
+            )
+        return mdr_gpu, tlc_gpu
 
     @nvtx.annotate("CuPyRAM.updat", color="yellow")
     def updat(self):
