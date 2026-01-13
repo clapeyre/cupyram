@@ -156,3 +156,8 @@ comparison_plots/
 # Generated test data
 tests/baseline_data.npz
 
+# hatch-vcs generated version file
+cupyram/_version.py
+
+# uv lock file
+uv.lock

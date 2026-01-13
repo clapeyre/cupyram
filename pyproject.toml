@@ -32,6 +32,7 @@ dependencies = [
     "numba-cuda>=0.23.0",
     "nvtx>=0.2.14",
     "tqdm>=4.67.1",
+    "click>=8.0.0",
 ]
 
 [project.optional-dependencies]
@@ -47,6 +48,9 @@ test = [
     "matplotlib", # Very hard to interpret physics-based tests without plotting
     "scipy",
 ]
+
+[project.scripts]
+cupyram-benchmark = "cupyram.benchmark:benchmark_cli"
 
 [project.urls]
 Homepage = "https://github.com/clapeyre/cupyram"

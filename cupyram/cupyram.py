@@ -282,6 +282,7 @@ class CuPyRAM:
         tlg: Transmission loss (dB) grid,
              NumPy 2D array, dimensions vz.size by vr.size.
         proc_time: Processing time (s).
+        propagation_time: Pure GPU propagation time (s) - only if benchmark_propagation=True.
         """
 
         t0 = process_time()
@@ -460,6 +461,11 @@ class CuPyRAM:
         All inputs are batched, compute per-ray values.
         """
         self._np = kwargs.get('np', CuPyRAM._np_default)
+        
+        # Benchmarking mode: time only _propagate_step() calls (pure GPU compute)
+        self._benchmark_propagation = kwargs.get('benchmark_propagation', False)
+        if self._benchmark_propagation:
+            self.propagation_time = 0.0  # Accumulator for pure propagation time
 
         # Compute per-ray c0 values (always batched now)
         if 'c0' in kwargs:
@@ -797,6 +803,10 @@ class CuPyRAM:
           (for validation and comparison)
         """
         
+        # Start timing if in benchmark mode
+        if self._benchmark_propagation:
+            t_prop_start = process_time()
+        
         if FUSED_KERNEL:
             # === OPTIMIZED: Fused Sum-Padé Kernel with Super-Batch ===
             # Initialize environment (once per range step)
@@ -850,6 +860,11 @@ class CuPyRAM:
                 with nvtx.annotate(f"solve_j{j}", color="green"):
                     solve(self.u, self.v, self.s1, self.s2, self.s3,
                           self.r1, self.r2, self.r3, self.iz, self.nz)
+        
+        # End timing if in benchmark mode
+        if self._benchmark_propagation:
+            cuda.synchronize()  # Ensure GPU work is complete for accurate timing
+            self.propagation_time += process_time() - t_prop_start
     
     def _outpt(self):
         """Compute transmission loss outputs on GPU using CUDA kernel."""
