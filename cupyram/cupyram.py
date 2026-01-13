@@ -783,28 +783,70 @@ class CuPyRAM:
         self.alpb = cupy.sqrt(self.rhob * self.cb / c0_ray)  # [Nz+2, N_env]
         
         # === STEP 3: Compute frequency-dependent ksqw, ksqb (N_calc) ===
-        # Broadcast environment arrays [Nz+2, N_env] -> [Nz+2, N_calc]
-        with nvtx.annotate("expand_frequency_dependent", color="magenta"):
-            # Optimize: avoid unnecessary copies for single frequency
-            if self._n_freq == 1:
-                # No expansion needed - arrays are already correct shape
-                cw_expanded = self.cw
-                cb_expanded = self.cb
-                attn_expanded = self.attn
-            else:
-                # Multi-frequency: repeat environment arrays
-                cw_expanded = cupy.repeat(self.cw, self._n_freq, axis=1)  # [Nz+2, N_calc]
-                cb_expanded = cupy.repeat(self.cb, self._n_freq, axis=1)
-                attn_expanded = cupy.repeat(self.attn, self._n_freq, axis=1)
+        if self._n_freq == 1:
+            # --- SINGLE FREQUENCY CASE (Legacy/Simple) ---
+            # No expansion needed - arrays are already correct shape
+            # We just do the math using standard CuPy operations
             
-            # Use cached GPU arrays (computed once in setup()) - avoids CPU->GPU transfer
+            # Use cached GPU arrays
             omega_arr = self._omega_arr_cached
             k0_sq = self._k0_sq_cached
             
-            # Compute wavenumber terms [Nz+2, N_calc]
-            self.ksqw = (omega_arr / cw_expanded)**2 - k0_sq
-            term = (omega_arr / cb_expanded) * (1 + 1j * self.eta * attn_expanded)
-            self.ksqb = term**2 - k0_sq
+            # Compute ksqw
+            # Note: Use x*x instead of x**2 (2-3x faster)
+            omega_over_cw = omega_arr / self.cw
+            self.ksqw = omega_over_cw * omega_over_cw - k0_sq
+            
+            # Compute ksqb
+            omega_over_cb = omega_arr / self.cb
+            term = omega_over_cb * (1 + 1j * self.eta * self.attn)
+            self.ksqb = term * term - k0_sq
+        else:
+            # --- MULTI-FREQUENCY CASE (Optimized) ---
+            # Use broadcasting + In-place Float32 Math to avoid VRAM explosion
+            with nvtx.annotate("expand_frequency_arrays", color="magenta"):
+                # 1. Create Views (No copy, instantaneous)
+                cw_view = self.cw.reshape(self.nz + 2, self._n_env, 1)
+                cb_view = self.cb.reshape(self.nz + 2, self._n_env, 1)
+                attn_view = self.attn.reshape(self.nz + 2, self._n_env, 1)
+
+                # 2. Cast constants to float32/complex64 ONCE to prevent float64 promotion
+                # This prevents the creation of massive 1.2GB/2.4GB temporary arrays
+                omega_f32 = self._omega_arr_cached.astype(cupy.float32).reshape(1, self._n_env, self._n_freq)
+                k0_sq_f32 = self._k0_sq_cached.astype(cupy.float32).reshape(1, self._n_env, self._n_freq)
+
+                # 3. KSQW: Compute directly into output array (In-place)
+                # Create a view of the destination array with the broadcast shape
+                ksqw_out = self.ksqw.view()
+                ksqw_out.shape = (self.nz + 2, self._n_env, self._n_freq)
+
+                # ksqw = (w/cw)^2 - k0^2
+                cupy.divide(omega_f32, cw_view, out=ksqw_out)      # Write w/cw directly to output
+                cupy.square(ksqw_out, out=ksqw_out)                # Square in-place
+                cupy.subtract(ksqw_out, k0_sq_f32, out=ksqw_out)   # Subtract k0^2 in-place
+
+                # 4. KSQB: Compute directly into output array (In-place)
+                ksqb_out = self.ksqb.view()
+                ksqb_out.shape = (self.nz + 2, self._n_env, self._n_freq)
+                
+                # We need one temp for the complex term, but we keep it complex64
+                # term = (w/cb) * (1 + 1j*eta*attn)
+                eta_f32 = cupy.float32(self.eta)
+                
+                # Use ksqb_out as temporary storage for (w/cb)
+                cupy.divide(omega_f32, cb_view, out=ksqb_out.real) # Real part = w/cb
+                ksqb_out.imag[:] = 0                               # Reset imag
+                
+                # Compute term: multiplies (w/cb) by (1 + 1j*eta*attn)
+                # This uses a fused kernel in CuPy
+                term = ksqb_out * (1.0 + 1j * eta_f32 * attn_view)
+                
+                # Final calculation: term^2 - k0^2
+                cupy.square(term, out=ksqb_out)
+                cupy.subtract(ksqb_out, k0_sq_f32, out=ksqb_out)
+
+                print("Optimized F32 broadcasting running!")
+        
 
     @nvtx.annotate("CuPyRAM._propagate_step", color="red")
     def _propagate_step(self):
