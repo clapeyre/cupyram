@@ -18,9 +18,11 @@ from numba import cuda, complex128
 
 
 # The fused kernel uses 142 registers per thread on GA100. A 192-thread
-# block permits two resident blocks (12 warps) per SM, versus one 256-thread
-# block (8 warps), while keeping the launch tuned for CuPyRAM's large batches.
-FUSED_THREADS_PER_BLOCK = 192
+# Splitting the product-form Padé terms across launches reduces this kernel
+# from 142 to 74 registers per thread on A100. At 128 threads per block, that
+# permits six resident blocks (24 warps) per SM for CuPyRAM's large batches.
+FUSED_THREADS_PER_BLOCK = 128
+SPLIT_PADE_KERNELS = True
 
 
 @cuda.jit(device=True, inline=True)
@@ -160,6 +162,49 @@ def fused_sum_pade_kernel(
     # u_out now contains the result of applying all Padé operators
 
 
+@cuda.jit
+def fused_single_pade_kernel(
+    u,
+    f1, f2, f3, ksq,
+    k0_arr, dz, nz,
+    pd1_vals, pd2_vals,
+    tdma_upper, tdma_rhs,
+    total_batch_size, n_freqs
+):
+    """Apply one product-form Padé operator per calculation."""
+    b = cuda.grid(1)
+    if b >= total_batch_size:
+        return
+
+    env_idx = b // n_freqs
+    k0 = k0_arr[b]
+    pd1_j = pd1_vals[b]
+    pd2_j = pd2_vals[b]
+    eps = complex128(1e-30)
+
+    r1, r2, r3, s1, s2, s3 = compute_galerkin_coeffs(
+        1, b, env_idx, f1, f2, f3, ksq, k0, dz, pd1_j, pd2_j
+    )
+    rhs = s1 * u[0, b] + s2 * u[1, b] + s3 * u[2, b] + eps
+    tdma_upper[1, b] = r3 / r2
+    tdma_rhs[1, b] = rhs / r2
+
+    for i in range(2, nz + 1):
+        r1, r2, r3, s1, s2, s3 = compute_galerkin_coeffs(
+            i, b, env_idx, f1, f2, f3, ksq, k0, dz, pd1_j, pd2_j
+        )
+        rhs = s1 * u[i-1, b] + s2 * u[i, b] + s3 * u[i+1, b] + eps
+
+        denom = r2 - r1 * tdma_upper[i-1, b]
+        tdma_upper[i, b] = r3 / denom
+        tdma_rhs[i, b] = (rhs - r1 * tdma_rhs[i-1, b]) / denom + eps
+
+    u[nz, b] = tdma_rhs[nz, b]
+
+    for i in range(nz - 1, 0, -1):
+        u[i, b] = tdma_rhs[i, b] - tdma_upper[i, b] * u[i+1, b] + eps
+
+
 def fused_sum_pade_solve(
     u_in, u_out,
     f1, f2, f3, ksq,
@@ -208,16 +253,31 @@ def fused_sum_pade_solve(
     threads_per_block = min(FUSED_THREADS_PER_BLOCK, batch_size)
     blocks_per_grid = (batch_size + threads_per_block - 1) // threads_per_block
     
-    # Launch kernel
-    with nvtx.annotate("fused_sum_pade_kernel", color="red"):
-        fused_sum_pade_kernel[blocks_per_grid, threads_per_block](
-            u_in_dev, u_out_dev,
-            f1_dev, f2_dev, f3_dev, ksq_dev,
-            k0_dev, dz, iz_dev, nz,
-            pd1_dev, pd2_dev,
-            tdma_upper_dev, tdma_rhs_dev,
-            pd1.shape[0],  # n_pade
-            batch_size,    # total_batch_size (N_calc)
-            n_freqs        # n_freqs for index mapping
-        )
+    if SPLIT_PADE_KERNELS:
+        if u_in.data.ptr != u_out.data.ptr:
+            cupy.copyto(u_out, u_in)
 
+        with nvtx.annotate("fused_single_pade_kernels", color="red"):
+            for pade_idx in range(pd1.shape[0]):
+                pd1_term_dev = cuda.as_cuda_array(pd1[pade_idx, :])
+                pd2_term_dev = cuda.as_cuda_array(pd2[pade_idx, :])
+                fused_single_pade_kernel[blocks_per_grid, threads_per_block](
+                    u_out_dev,
+                    f1_dev, f2_dev, f3_dev, ksq_dev,
+                    k0_dev, dz, nz,
+                    pd1_term_dev, pd2_term_dev,
+                    tdma_upper_dev, tdma_rhs_dev,
+                    batch_size, n_freqs
+                )
+    else:
+        with nvtx.annotate("fused_sum_pade_kernel", color="red"):
+            fused_sum_pade_kernel[blocks_per_grid, threads_per_block](
+                u_in_dev, u_out_dev,
+                f1_dev, f2_dev, f3_dev, ksq_dev,
+                k0_dev, dz, iz_dev, nz,
+                pd1_dev, pd2_dev,
+                tdma_upper_dev, tdma_rhs_dev,
+                pd1.shape[0],  # n_pade
+                batch_size,    # total_batch_size (N_calc)
+                n_freqs        # n_freqs for index mapping
+            )

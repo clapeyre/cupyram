@@ -79,6 +79,49 @@ Ada has different FP64 throughput, cache behavior, clocks, and GDDR memory
 bandwidth and latency from A100. Those differences can change the best launch
 size even though the register-capacity argument remains favorable.
 
+## One kernel launch per Padé term
+
+The product-form Padé loop was subsequently split so that each kernel launch
+applies one Padé term. The launches reuse the same tridiagonal work arrays, so
+this does not increase the VRAM footprint. It does introduce a global
+synchronization point and another pass through the field arrays for every
+term, but reduces the live state within each thread.
+
+On the same A100, the single-term kernel compiled to 74 registers per thread,
+down from 142. With 128 threads per block, this permits six resident blocks,
+or 24 warps, per SM:
+
+| Metric | All terms, 192 threads | One term, 128 threads |
+|---|---:|---:|
+| Registers per thread | 142 | 74 |
+| Theoretical resident warps per SM | 12 | 24 |
+| Theoretical occupancy | 18.75% | 37.5% |
+| Achieved occupancy | 16.25% | 26.93% |
+| Compute (SM) throughput | 38.5% | 42.89% |
+| DRAM throughput | 641 GB/s | 689 GB/s |
+| Scheduler cycles with no eligible warp | 60.4% | 57.9% |
+
+A matched, uninstrumented benchmark used 165,000 rays, 2,201 depth points,
+499 range steps over 60 km, and 10 untimed warm-up steps:
+
+| Metric | All terms, 192 threads | One term, 128 threads | Change |
+|---|---:|---:|---:|
+| Propagation time per step | 274.37 ms | 251.45 ms | -8.35% |
+| Propagation throughput | 601.2k ray-steps/s | 656.2k ray-steps/s | +9.15% |
+| Measured end-to-end time | 176.07 s | 166.48 s | -5.45% |
+| GPU memory-pool footprint | 76.53 GiB | 76.53 GiB | unchanged |
+
+The 128- and 192-thread versions of the single-term kernel were effectively
+tied: 251.45 versus 252.00 ms per step. The 128-thread launch is the default
+because it produces more blocks for scheduling without reducing the
+register-limited theoretical occupancy.
+
+This result is specific to the A100 software and workload described above.
+In a shorter 100,000-ray test, the split formulation was only about 2% faster,
+which is close to normal benchmark variation. Its benefit should therefore be
+treated as a large-workload optimization, and it should be re-benchmarked on
+RTX 6000 Ada, H100, H200, or after compiler changes.
+
 References:
 
 - [NVIDIA Ada GPU Architecture Tuning Guide](https://docs.nvidia.com/cuda/ada-tuning-guide/)

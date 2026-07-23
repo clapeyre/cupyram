@@ -153,6 +153,38 @@ def test_compute_grids_false_preserves_line_outputs(pekeris_params):
     )
 
 
+def test_split_pade_kernels_match_all_terms_kernel(pekeris_params, monkeypatch):
+    """Splitting product-form Padé terms across launches preserves results."""
+    from cupyram import fused_kernel
+
+    monkeypatch.setattr(fused_kernel, 'SPLIT_PADE_KERNELS', False)
+    all_terms = CuPyRAM(
+        **pekeris_params,
+        batch_size=2,
+        compute_grids=False,
+    ).run()
+
+    monkeypatch.setattr(fused_kernel, 'SPLIT_PADE_KERNELS', True)
+    split_terms = CuPyRAM(
+        **pekeris_params,
+        batch_size=2,
+        compute_grids=False,
+    ).run()
+
+    np.testing.assert_allclose(
+        split_terms['TL Line'],
+        all_terms['TL Line'],
+        rtol=0,
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        split_terms['CP Line'],
+        all_terms['CP Line'],
+        rtol=0,
+        atol=1e-12,
+    )
+
+
 def test_batch_processing_time(pekeris_params):
     """Verify that batch processing completes"""
     batch_size = 16
