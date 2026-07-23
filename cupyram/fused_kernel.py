@@ -17,6 +17,12 @@ import nvtx
 from numba import cuda, complex128
 
 
+# The fused kernel uses 142 registers per thread on GA100. A 192-thread
+# block permits two resident blocks (12 warps) per SM, versus one 256-thread
+# block (8 warps), while keeping the launch tuned for CuPyRAM's large batches.
+FUSED_THREADS_PER_BLOCK = 192
+
+
 @cuda.jit(device=True, inline=True)
 def compute_galerkin_coeffs(i, calc_idx, env_idx, f1, f2, f3, ksq, k0, dz, pd1_val, pd2_val):
     """
@@ -199,7 +205,7 @@ def fused_sum_pade_solve(
     tdma_rhs_dev = cuda.as_cuda_array(tdma_rhs)
     
     # Launch configuration: 1 thread per calculation
-    threads_per_block = min(256, batch_size)
+    threads_per_block = min(FUSED_THREADS_PER_BLOCK, batch_size)
     blocks_per_grid = (batch_size + threads_per_block - 1) // threads_per_block
     
     # Launch kernel
