@@ -59,7 +59,7 @@ def outpt_kernel(r, mdr_in, ndr, ndz, tlc_in, f3, u, _dir, ir,
 
 
 def outpt_cuda(r, mdr, ndr, ndz, tlc, f3, u, _dir, ir, tll, tlg, cpl, cpg, batch_size=1, 
-               mdr_gpu=None, tlc_gpu=None):
+               mdr_gpu=None, tlc_gpu=None, compute_grids=True):
     """
     GPU-accelerated output computation using CUDA.
     
@@ -68,10 +68,12 @@ def outpt_cuda(r, mdr, ndr, ndz, tlc, f3, u, _dir, ir, tll, tlg, cpl, cpg, batch
     
     Args:
         mdr_gpu, tlc_gpu: Optional CuPy arrays for counters (kept on GPU to avoid D2H transfers)
+        compute_grids: Whether to compute full depth-grid outputs. Receiver-depth
+            line outputs are always computed.
     
     Returns: (mdr_gpu, tlc_gpu) as CuPy arrays (stay on GPU)
     """
-    nvz = tlg.shape[1] if tlg.ndim == 3 else tlg.shape[0]
+    nvz = (tlg.shape[1] if tlg.ndim == 3 else tlg.shape[0]) if compute_grids else 0
     
     # Use provided GPU arrays or create new ones
     if mdr_gpu is None:
@@ -94,4 +96,3 @@ def outpt_cuda(r, mdr, ndr, ndz, tlc, f3, u, _dir, ir, tll, tlg, cpl, cpg, batch
     
     # Return GPU arrays (no D2H transfer!)
     return mdr_out, tlc_out
-

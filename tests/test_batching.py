@@ -124,6 +124,35 @@ def test_batch_grid_output(pekeris_params):
     print(f"✓ TL Grid shape: {tl_grid.shape} (batch, depth, range)")
 
 
+def test_compute_grids_false_preserves_line_outputs(pekeris_params):
+    """Disabling grid outputs must not disable receiver-depth line outputs."""
+    with_grids = CuPyRAM(
+        **pekeris_params,
+        batch_size=2,
+        compute_grids=True,
+    ).run()
+    without_grids = CuPyRAM(
+        **pekeris_params,
+        batch_size=2,
+        compute_grids=False,
+    ).run()
+
+    assert without_grids['TL Grid'] is None
+    assert without_grids['CP Grid'] is None
+    np.testing.assert_allclose(
+        without_grids['TL Line'],
+        with_grids['TL Line'],
+        rtol=0,
+        atol=1e-10,
+    )
+    np.testing.assert_allclose(
+        without_grids['CP Line'],
+        with_grids['CP Line'],
+        rtol=0,
+        atol=1e-12,
+    )
+
+
 def test_batch_processing_time(pekeris_params):
     """Verify that batch processing completes"""
     batch_size = 16
@@ -278,4 +307,3 @@ def test_munk_batched_vs_cpu(munk_params):
         f"Batched CuPyRAM (Munk) differs from CPU PyRAM by {max_diff:.3f} dB (max allowed: 2.0 dB)"
     
     print(f"✓ Munk batched vs CPU: max diff = {max_diff:.4f} dB, RMS = {rms_diff:.4f} dB")
-

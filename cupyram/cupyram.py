@@ -302,9 +302,9 @@ class CuPyRAM:
 
             self.r = (rn + 2) * self._dr
 
-            # Only compute output if grids are enabled
-            if self._compute_grids:
-                self.mdr_gpu, self.tlc_gpu = self._outpt()
+            # Receiver-depth line output is always computed. Full depth-grid
+            # output is controlled separately by compute_grids.
+            self.mdr_gpu, self.tlc_gpu = self._outpt()
 
             # Sync every N steps (e.g., 50 or 100).
             # This makes the progress bar accurate with <0.1% overhead.
@@ -745,9 +745,9 @@ class CuPyRAM:
         self.profl()
         self.selfs()  # Initialize acoustic field on GPU
         
-        # Only compute output if grids are enabled
-        if self._compute_grids:
-            self.mdr_gpu, self.tlc_gpu = self._outpt()
+        # Receiver-depth line output is always computed. Full depth-grid
+        # output is controlled separately by compute_grids.
+        self.mdr_gpu, self.tlc_gpu = self._outpt()
 
         # Compute Padé coefficients per (env, freq) pair
         with nvtx.annotate("compute_pade_batch", color="purple"):
@@ -972,7 +972,8 @@ class CuPyRAM:
                 f3_expanded, u_device, self.dir, self.ir,
                 self.tll, self.tlg, self.cpl, self.cpg,
                 batch_size=self._total_batch,
-                mdr_gpu=self.mdr_gpu, tlc_gpu=self.tlc_gpu
+                mdr_gpu=self.mdr_gpu, tlc_gpu=self.tlc_gpu,
+                compute_grids=self._compute_grids,
             )
         return mdr_gpu, tlc_gpu
 
