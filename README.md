@@ -81,10 +81,19 @@ tl = model.run()  # Returns transmission loss array
 Performance testing is ongoing. Initial tests suggest that one data-center
 class GPU runs about 30x faster than 1 CPU core.
 
-To leverage GPUs, it is important to maximize your batch size. The only limit
-is the system's VRAM. Typically, data-center class GPUs can handle 50,000
-concurrent acoustic rays (the equivalent of one PyRAM class implementation)
-in parallel before saturating VRAM.
+CuPyRAM is designed for large batches. Performance depends on both available
+VRAM and kernel residency: submitting many rays keeps work queued, but register
+pressure can still limit the number of warps executing concurrently on each
+GPU SM.
+
+The fused-kernel launch configuration is currently tuned and validated on an
+NVIDIA A100 SXM4 80 GB. Changing from 256 to 192 threads per block improved a
+165,000-ray propagation benchmark from 485.8k to 600.4k ray-steps/s without
+increasing VRAM use. Other GPU architectures should retain 192 as a strong
+starting point but verify it when performance is critical.
+
+See [GPU performance notes](docs/performance.md) for the benchmark methodology,
+hardware-counter results, and portability guidance for Ada and other GPUs.
 
 ## Testing
 
@@ -135,4 +144,3 @@ Contributions are welcome! Please feel free to submit issues or pull requests.
 - Dr. Michael D. Collins for the original RAM implementation
 - Marcus Donnelly for the PyRAM Python adaptation
 - The Numba CUDA and CuPy development teams for the excellent GPU array library
-
