@@ -31,7 +31,7 @@ from numba import cuda
 from tqdm import tqdm
 from cupyram.solve import solve
 from cupyram.outpt import outpt_cuda
-from cupyram.pade import compute_pade_coefficients, compute_pade_coefficients_batch
+from cupyram.pade import compute_pade_coefficients
 from cupyram.profl import profl_cuda_launcher
 from cupyram.updat import updat_indices_cuda
 from cupyram.matrc import matrc_cuda_init_profiles, matrc_cuda_single_pade
@@ -379,6 +379,41 @@ class CuPyRAM:
 
         return results
 
+    def _compute_pade_batch(self, ip):
+        """Compute and cache Padé coefficients for all environment/frequency pairs."""
+        pd1_batch = numpy.empty(
+            (self._np, self._total_batch), dtype=numpy.complex128
+        )
+        pd2_batch = numpy.empty_like(pd1_batch)
+
+        for env_idx, c0 in enumerate(self._c0_array):
+            for freq_idx, freq in enumerate(self._freqs):
+                cache_key = (
+                    float(freq),
+                    float(c0),
+                    int(self._np),
+                    int(self._ns),
+                    float(self._dr),
+                    int(ip),
+                )
+                coefficients = self._pade_coefficient_cache.get(cache_key)
+                if coefficients is None:
+                    coefficients = compute_pade_coefficients(
+                        freq=freq,
+                        c0=c0,
+                        np_pade=self._np,
+                        ns=self._ns,
+                        dr=self._dr,
+                        ip=ip,
+                    )
+                    self._pade_coefficient_cache[cache_key] = coefficients
+
+                calc_idx = env_idx * self._n_freq + freq_idx
+                pd1_batch[:, calc_idx] = coefficients[0]
+                pd2_batch[:, calc_idx] = coefficients[1]
+
+        return cupy.asarray(pd1_batch), cupy.asarray(pd2_batch)
+
     def check_inputs(self, z_ss, rp_ss, cw, z_sb, rp_sb, cb, rhob, attn, rbzb):
         """
         Validate batched inputs. All inputs are numpy arrays [batch_size, ...] with possible NaN padding.
@@ -445,7 +480,15 @@ class CuPyRAM:
         # Heavy arrays (_cw, _cb, _rhob, _attn) are streamed on-demand in profl()
         # This saves massive VRAM for large batch sizes with varying-length profiles
         
-        # Light arrays: indices and bathymetry (always needed on GPU)
+        # Light arrays: indices and bathymetry (always needed on GPU).
+        # Retain their NumPy forms for host-side setup to avoid thousands of
+        # tiny device-to-host transfers.
+        self._z_ss_cpu = self._z_ss
+        self._rp_ss_cpu = self._rp_ss
+        self._z_sb_cpu = self._z_sb
+        self._rp_sb_cpu = self._rp_sb
+        self._rbzb_cpu = self._rbzb
+
         self._z_ss = cupy.asarray(self._z_ss)
         self._rp_ss = cupy.asarray(self._rp_ss)
         self._z_sb = cupy.asarray(self._z_sb)
@@ -500,11 +543,10 @@ class CuPyRAM:
         self._ndr = kwargs.get('ndr', CuPyRAM._ndr_default)
         self._ndz = kwargs.get('ndz', CuPyRAM._ndz_default)
 
-        # Compute zmplt: maximum bathymetry depth across all rays (filter NaN)
-        # After check_inputs(), these are always CuPy arrays
-        rbzb_cpu = cupy.asnumpy(self._rbzb)
-        rp_ss_cpu = cupy.asnumpy(self._rp_ss)
-        rp_sb_cpu = cupy.asnumpy(self._rp_sb)
+        # Compute scalar grid bounds from the retained host-side inputs.
+        rbzb_cpu = self._rbzb_cpu
+        rp_ss_cpu = self._rp_ss_cpu
+        rp_sb_cpu = self._rp_sb_cpu
         
         self._zmplt = kwargs.get('zmplt', 
                                  max(numpy.nanmax(rbzb[:, 1]) for rbzb in rbzb_cpu))
@@ -518,6 +560,7 @@ class CuPyRAM:
 
         self._ns = kwargs.get('ns', CuPyRAM._ns_default)
         self._rs = kwargs.get('rs', self._rmax + self._dr)
+        self._pade_coefficient_cache = {}
 
         self._lyrw = kwargs.get('lyrw', CuPyRAM._lyrw_default)
 
@@ -533,11 +576,12 @@ class CuPyRAM:
         """
         # Extend bathymetry to rmax if needed (per-ray)
         # Note: We need to update the NaN-padded array, potentially growing it
+        rbzb_cpu = self._rbzb_cpu
         max_rbzb_len = 0
         extended_rbzb = []
         for i in range(self._batch_size):
             # Get valid (non-NaN) portion of bathymetry
-            rbzb_valid, _ = self._get_valid_slice(self._rbzb[i])
+            rbzb_valid, _ = self._get_valid_slice(rbzb_cpu[i])
             if rbzb_valid[-1, 0] < self._rmax:
                 # Extend
                 extended = numpy.append(
@@ -556,16 +600,16 @@ class CuPyRAM:
             new_rbzb = numpy.full((self._batch_size, max_rbzb_len, 2), numpy.nan)
             for i in range(self._batch_size):
                 new_rbzb[i, :extended_rbzb[i].shape[0], :] = extended_rbzb[i]
-            self._rbzb = cupy.asarray(new_rbzb)
+            rbzb_cpu = new_rbzb
         else:
-            # Fits in existing padding, update on CPU then transfer to GPU
-            rbzb_cpu = cupy.asnumpy(self._rbzb)
+            # Fits in existing padding, update on CPU
             for i in range(self._batch_size):
                 rbzb_cpu[i, :extended_rbzb[i].shape[0], :] = extended_rbzb[i]
                 # Clear any old data beyond the new valid length
                 if extended_rbzb[i].shape[0] < rbzb_cpu.shape[1]:
                     rbzb_cpu[i, extended_rbzb[i].shape[0]:, :] = numpy.nan
-            self._rbzb = cupy.asarray(rbzb_cpu)
+        self._rbzb_cpu = rbzb_cpu
+        self._rbzb = cupy.asarray(rbzb_cpu)
 
         self.eta = 1 / (40 * numpy.pi * numpy.log10(numpy.exp(1)))
         self.ib = [0] * self._batch_size  # Bathymetry pair index per ray
@@ -577,18 +621,21 @@ class CuPyRAM:
         self.dir = ri - self.ir  # Offset
         
         # Adjust seabed depths relative to deepest water profile point (per-ray)
+        z_ss_cpu = self._z_ss_cpu
+        z_sb_cpu = self._z_sb_cpu.copy()
         for i in range(self._batch_size):
             # Get valid portions (filter NaN padding)
-            z_ss_valid, _ = self._get_valid_slice(self._z_ss[i])
-            z_sb_valid, z_sb_len = self._get_valid_slice(self._z_sb[i])
+            z_ss_valid, _ = self._get_valid_slice(z_ss_cpu[i])
+            z_sb_valid, z_sb_len = self._get_valid_slice(z_sb_cpu[i])
             
-            # Add offset and update valid portion (on GPU)
+            # Add offset and update valid portion on the host
             z_sb_adjusted = z_sb_valid + z_ss_valid[-1]
-            self._z_sb[i, :z_sb_len] = cupy.asarray(z_sb_adjusted)
+            z_sb_cpu[i, :z_sb_len] = z_sb_adjusted
+
+        self._z_sb_cpu = z_sb_cpu
+        self._z_sb = cupy.asarray(z_sb_cpu)
         
         # Compute zmax_sb from valid portions only
-        # After check_inputs(), self._z_sb is always a CuPy array
-        z_sb_cpu = cupy.asnumpy(self._z_sb)
         zmax_sb = max(numpy.nanmax(z_sb[:z_sb_len]) 
                       for z_sb, (_, z_sb_len) in 
                       zip(z_sb_cpu, [self._get_valid_slice(z_sb_cpu[i]) for i in range(self._n_env)]))
@@ -600,7 +647,7 @@ class CuPyRAM:
         # Initial bathymetry index (per-environment) - use valid portions only
         iz_list = []
         for i in range(self._n_env):
-            rbzb_valid, _ = self._get_valid_slice(self._rbzb[i])
+            rbzb_valid, _ = self._get_valid_slice(rbzb_cpu[i])
             iz_val = int(numpy.floor(rbzb_valid[0, 1] / self._dz))
             iz_list.append(max(1, min(self.nz - 1, iz_val)))
         
@@ -704,26 +751,7 @@ class CuPyRAM:
 
         # Compute Padé coefficients per (env, freq) pair
         with nvtx.annotate("compute_pade_batch", color="purple"):
-            pd1_list = []
-            pd2_list = []
-            
-            # Order: [env0_freq0, env0_freq1, ..., env0_freqN, env1_freq0, ...]
-            for env_idx in range(self._n_env):
-                for freq_idx in range(self._n_freq):
-                    pd1, pd2 = compute_pade_coefficients(
-                        freq=self._freqs[freq_idx],
-                        c0=self._c0_array[env_idx],
-                        np_pade=self._np, ns=self._ns, 
-                        dr=self._dr, ip=1
-                    )
-                    pd1_list.append(pd1)
-                    pd2_list.append(pd2)
-            
-            # Stack and transfer to GPU: [N_calc, np] -> transpose to [np, N_calc]
-            pd1_stacked = numpy.array(pd1_list)  # [N_calc, np]
-            pd2_stacked = numpy.array(pd2_list)
-            self.pd1 = cupy.asarray(pd1_stacked.T)  # [np, N_calc]
-            self.pd2 = cupy.asarray(pd2_stacked.T)
+            self.pd1, self.pd2 = self._compute_pade_batch(ip=1)
 
     @nvtx.annotate("CuPyRAM.profl", color="cyan")
     def profl(self):
@@ -977,26 +1005,7 @@ class CuPyRAM:
             self._ns = 0
             self._rs = self._rmax + self._dr
             with nvtx.annotate("compute_pade_stability", color="purple"):
-                # Recompute for all (env, freq) pairs
-                pd1_list = []
-                pd2_list = []
-                
-                for env_idx in range(self._n_env):
-                    for freq_idx in range(self._n_freq):
-                        pd1, pd2 = compute_pade_coefficients(
-                            freq=self._freqs[freq_idx],
-                            c0=self._c0_array[env_idx],
-                            np_pade=self._np, ns=self._ns, 
-                            dr=self._dr, ip=1
-                        )
-                        pd1_list.append(pd1)
-                        pd2_list.append(pd2)
-                
-                # Update Padé coefficients for all calculations
-                pd1_stacked = numpy.array(pd1_list)
-                pd2_stacked = numpy.array(pd2_list)
-                self.pd1[:, :] = cupy.asarray(pd1_stacked.T)
-                self.pd2[:, :] = cupy.asarray(pd2_stacked.T)
+                self.pd1[:, :], self.pd2[:, :] = self._compute_pade_batch(ip=1)
 
     @nvtx.annotate("CuPyRAM.selfs", color="magenta")
     def selfs(self):
@@ -1038,26 +1047,7 @@ class CuPyRAM:
         
         # Compute Padé coefficients per (env, freq) pair
         with nvtx.annotate("compute_pade_batch_selfs", color="purple"):
-            pd1_list = []
-            pd2_list = []
-            
-            # Order: [env0_freq0, env0_freq1, ..., env0_freqN, env1_freq0, ...]
-            for env_idx in range(self._n_env):
-                for freq_idx in range(self._n_freq):
-                    pd1, pd2 = compute_pade_coefficients(
-                        freq=self._freqs[freq_idx],
-                        c0=self._c0_array[env_idx],
-                        np_pade=self._np, ns=self._ns, 
-                        dr=self._dr, ip=2
-                    )
-                    pd1_list.append(pd1)
-                    pd2_list.append(pd2)
-            
-            # Stack and transfer to GPU: [N_calc, np] -> transpose to [np, N_calc]
-            pd1_stacked = numpy.array(pd1_list)  # [N_calc, np]
-            pd2_stacked = numpy.array(pd2_list)
-            self.pd1 = cupy.asarray(pd1_stacked.T)  # [np, N_calc]
-            self.pd2 = cupy.asarray(pd2_stacked.T)
+            self.pd1, self.pd2 = self._compute_pade_batch(ip=2)
         
         # Apply full Padé operator
         self._propagate_step()
